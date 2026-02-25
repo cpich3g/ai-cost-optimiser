@@ -1,0 +1,24 @@
+approvalPolicy:
+  version: 1
+  sequence:
+    - stage: finance
+      required: true
+      timeoutHours: 24
+      approverGroup: justinjoy@microsoft.com
+      onReject: stop
+      onExpire: stop
+    - stage: engineering
+      required: true
+      timeoutHours: 24
+      approverGroup: justinjoy@microsoft.com
+      onReject: stop
+      onExpire: stop
+  payloadContract:
+    approvalId: string
+    batchId: string
+    stage: finance|engineering
+    deadline: iso8601-utc
+    riskSummary:
+      level: low|medium|high|critical
+      score: number
+      reasons: string[]

@@ -1,0 +1,169 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "$connections": {
+      "type": "Object",
+      "defaultValue": {}
+    },
+    "callbackApiBaseUrl": {
+      "type": "String"
+    },
+    "callbackToken": {
+      "type": "SecureString"
+    }
+  },
+  "triggers": {
+    "When_an_HTTP_request_is_received": {
+      "type": "Request",
+      "kind": "Http",
+      "inputs": {
+        "schema": {
+          "type": "object",
+          "required": ["approvalId", "batchId", "stage", "deadline", "riskSummary"],
+          "properties": {
+            "approvalId": { "type": "string" },
+            "batchId": { "type": "string" },
+            "stage": { "type": "string", "enum": ["finance", "engineering"] },
+            "deadline": { "type": "string", "format": "date-time" },
+            "riskSummary": {
+              "type": "object",
+              "required": ["level", "score"],
+              "properties": {
+                "level": { "type": "string" },
+                "score": { "type": "number" },
+                "reasons": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "actions": {
+    "Send_Finance_Approval_Email": {
+      "runAfter": {},
+      "type": "ApiConnection",
+      "inputs": {
+        "host": {
+          "connection": {
+            "name": "@parameters('$connections')['office365']['connectionId']"
+          }
+        },
+        "method": "post",
+        "path": "/v2/Mail",
+        "body": {
+          "To": "justinjoy@microsoft.com",
+          "Subject": "Finance approval required: @{triggerBody()?['batchId']}",
+          "Body": "Please review approval @{triggerBody()?['approvalId']}. Risk level: @{triggerBody()?['riskSummary']?['level']}."
+        }
+      }
+    },
+    "Wait_For_Finance_Decision": {
+      "type": "Http",
+      "runAfter": {
+        "Send_Finance_Approval_Email": ["Succeeded"]
+      },
+      "inputs": {
+        "method": "GET",
+        "uri": "@{concat(parameters('callbackApiBaseUrl'), '/approvals/', triggerBody()?['approvalId'], '/finance')}",
+        "headers": {
+          "x-approval-token": "@parameters('callbackToken')"
+        }
+      }
+    },
+    "Finance_Approved": {
+      "type": "If",
+      "runAfter": {
+        "Wait_For_Finance_Decision": ["Succeeded"]
+      },
+      "expression": {
+        "equals": ["@body('Wait_For_Finance_Decision')?['decision']", "approve"]
+      },
+      "actions": {
+        "Send_Engineering_Approval_Email": {
+          "type": "ApiConnection",
+          "inputs": {
+            "host": {
+              "connection": {
+                "name": "@parameters('$connections')['office365']['connectionId']"
+              }
+            },
+            "method": "post",
+            "path": "/v2/Mail",
+            "body": {
+              "To": "justinjoy@microsoft.com",
+              "Subject": "Engineering approval required: @{triggerBody()?['batchId']}",
+              "Body": "Finance approved. Please review approval @{triggerBody()?['approvalId']}."
+            }
+          }
+        },
+        "Wait_For_Engineering_Decision": {
+          "type": "Http",
+          "runAfter": {
+            "Send_Engineering_Approval_Email": ["Succeeded"]
+          },
+          "inputs": {
+            "method": "GET",
+            "uri": "@{concat(parameters('callbackApiBaseUrl'), '/approvals/', triggerBody()?['approvalId'], '/engineering')}",
+            "headers": {
+              "x-approval-token": "@parameters('callbackToken')"
+            }
+          }
+        },
+        "Engineering_Approved": {
+          "type": "If",
+          "runAfter": {
+            "Wait_For_Engineering_Decision": ["Succeeded"]
+          },
+          "expression": {
+            "equals": ["@body('Wait_For_Engineering_Decision')?['decision']", "approve"]
+          },
+          "actions": {
+            "Complete_Approved": {
+              "type": "Response",
+              "kind": "Http",
+              "inputs": {
+                "statusCode": 200,
+                "body": {
+                  "approvalId": "@{triggerBody()?['approvalId']}",
+                  "decision": "approve"
+                }
+              }
+            }
+          },
+          "else": {
+            "actions": {
+              "Complete_Rejected_At_Engineering": {
+                "type": "Response",
+                "kind": "Http",
+                "inputs": {
+                  "statusCode": 200,
+                  "body": {
+                    "approvalId": "@{triggerBody()?['approvalId']}",
+                    "decision": "reject"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "actions": {
+          "Complete_Rejected_At_Finance": {
+            "type": "Response",
+            "kind": "Http",
+            "inputs": {
+              "statusCode": 200,
+              "body": {
+                "approvalId": "@{triggerBody()?['approvalId']}",
+                "decision": "reject"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
