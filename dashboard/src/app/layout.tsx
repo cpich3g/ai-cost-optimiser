@@ -21,8 +21,8 @@ const mono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Cost Optimiser Command Deck",
-  description: "Next.js dashboard to invoke and validate the Azure Cost Optimiser agent.",
+  title: "Azure Cost Optimisation Agent",
+  description: "Mission control dashboard to run and validate Azure Cost Optimisation Agent workflows.",
 };
 
 export default function RootLayout({

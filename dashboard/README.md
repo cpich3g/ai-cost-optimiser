@@ -1,36 +1,37 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Azure Cost Optimisation Agent
 
-## Getting Started
+This Next.js app is Mission Control for end-to-end Azure Cost Optimisation Agent validation.
 
-First, run the development server:
+## Quick start
 
 ```bash
+cp .env.example .env.local
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open `http://localhost:3000`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Required environment variables
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- `AGENT_FUNCTION_BASE_URL`
+- `AGENT_FUNCTION_KEY`
+- `LOGICAPP_TRIGGER_URL`
+- `MCP_SERVER_URL`
+- `MCP_SERVER_SCOPE`
+- `MCP_SERVER_TENANT_ID` (optional override; defaults from MCP metadata)
+- `MCP_SERVER_BEARER_TOKEN` (optional override)
+- `NEXT_PUBLIC_APPROVAL_RECIPIENT`
 
-## Learn More
+## Workflow
 
-To learn more about Next.js, take a look at the following resources:
+Authenticate your local identity for hosted MCP access (one-time per session):
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```bash
+az login --tenant 16b3c013-d300-468d-ac64-7eda0820b6d3 --scope 60a93168-daca-48be-9866-3e1e07c792f3/Mcp.Tools.ReadWrite
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+1. Enter only the **resource group** and click **Discover + start run**.
+2. The dashboard server calls the hosted Azure MCP server, discovers resources for that group, and starts `/api/cost-optimization/report`.
+3. Status auto-polls every 5 seconds.
+4. Use the decision controls to approve/reject when orchestration reaches approval stages.

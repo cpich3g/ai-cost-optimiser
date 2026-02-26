@@ -108,6 +108,12 @@ Set:
 - `LOGICAPP_TRIGGER_URL` (Logic App request trigger callback URL)
 - `NEXT_PUBLIC_APPROVAL_RECIPIENT` (display-only label in UI)
 
+MCP discovery and auth are handled by the Function App's managed identity — no local MCP credentials needed in the dashboard.
+
+The Function App requires these app settings for MCP:
+- `MCP_SERVER_URL` — hosted Azure MCP endpoint
+- `MCP_SERVER_SCOPE` — Entra scope for token acquisition (auto-detected from MCP metadata if omitted)
+
 ### 2) Run the UI
 
 ```bash
@@ -120,7 +126,7 @@ Open `http://localhost:3000`.
 ### 3) What gets tested
 
 - **Agent Orchestration tab**
-  - starts runs (`/api/cost-optimization/report`)
+  - starts runs from a single `resourceGroup` input (Function App discovers resources via MCP + starts orchestration)
   - polls run status (`/api/cost-optimization/{instanceId}/status`)
   - submits approval decisions (`/api/cost-optimization/{instanceId}/decide`)
 - **Logic App Email Flow tab**

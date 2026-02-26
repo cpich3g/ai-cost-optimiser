@@ -5,6 +5,8 @@ agent-framework-azurefunctions==1.0.0b260210
 agent-framework-durabletask==1.0.0b260210
 opentelemetry-semantic-conventions-ai==0.4.13
 azure-identity
+azure-mgmt-resource
 httpx
+httpx-sse
 python-dotenv
 pytest

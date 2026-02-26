@@ -1,32 +1,62 @@
-# Python
+# ------------------------------
+# Python / Azure Functions
+# ------------------------------
 __pycache__/
 *.py[cod]
 *.pyd
+*.egg-info/
 .venv/
 venv/
+env/
 build/
 dist/
 .coverage*
 htmlcov/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Local env/secrets
+# ------------------------------
+# Node / Next.js (dashboard)
+# ------------------------------
+node_modules/
+dashboard/node_modules/
+.next/
+dashboard/.next/
+out/
+dashboard/out/
+.turbo/
+dashboard/.turbo/
+coverage/
+dashboard/coverage/
+*.tsbuildinfo
+dashboard/next-env.d.ts
+
+# ------------------------------
+# Local env / secrets
+# ------------------------------
 .env
 .env.*
 *.local
+local.settings.json
 
+# ------------------------------
 # Azure local/runtime
+# ------------------------------
 .azure/
 .azure-functions-core-tools/
 .python_packages/
-local.settings.json
 
-# IDE/editor
+# ------------------------------
+# IDE / editor
+# ------------------------------
 .vscode/
 .idea/
 *.iml
 
+# ------------------------------
 # OS junk
+# ------------------------------
 .DS_Store
 Thumbs.db
 Desktop.ini

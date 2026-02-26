@@ -24,18 +24,18 @@ type OrchestrationStatus = {
   output?: unknown;
 };
 
-const defaultResources = JSON.stringify(
-  [
-    {
-      resource_id:
-        "/subscriptions/<sub-id>/resourceGroups/demo-rg/providers/Microsoft.Compute/virtualMachines/vm-cost-demo",
-      monthly_cost: 380,
-      metrics: { cpuUtilizationPercent: 3.4 },
-    },
-  ],
-  null,
-  2,
-);
+type StartByGroupResult = {
+  instance_id?: string;
+  status?: string;
+  discovered?: {
+    resource_group?: string;
+    resource_count?: number;
+    tool_name?: string;
+    transport?: string;
+    endpoint?: string;
+  };
+  discovered_preview?: unknown;
+};
 
 function buildLogicPayload() {
   const approvalId = `ui-${Date.now()}`;
@@ -95,9 +95,10 @@ async function requestJson(url: string, init?: RequestInit): Promise<ApiOutcome>
 }
 
 export default function Home() {
-  const [resourcesText, setResourcesText] = useState(defaultResources);
+  const [resourceGroup, setResourceGroup] = useState("rg-cost-optimiser");
   const [runId, setRunId] = useState("");
   const [instanceId, setInstanceId] = useState("");
+  const [startResult, setStartResult] = useState<StartByGroupResult | null>(null);
   const [healthResult, setHealthResult] = useState<unknown>(null);
   const [statusResult, setStatusResult] = useState<OrchestrationStatus | null>(null);
   const [decisionStage, setDecisionStage] = useState<"finance" | "engineering">("finance");
@@ -167,17 +168,17 @@ export default function Home() {
       <header className="noise-overlay panel-glass relative overflow-hidden rounded-3xl border px-6 py-6 shadow-2xl shadow-cyan-950/25">
         <div className="absolute -top-14 -right-10 h-52 w-52 rounded-full bg-cyan-300/20 blur-3xl" />
         <div className="absolute -bottom-20 -left-14 h-52 w-52 rounded-full bg-fuchsia-400/20 blur-3xl" />
-        <div className="relative flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
-          <div className="space-y-2">
-            <p className="text-xs uppercase tracking-[0.22em] text-cyan-200/80">Azure Cost Optimiser</p>
-            <h1 className="font-display text-3xl leading-tight font-semibold text-white md:text-4xl">
-              Command Deck for End-to-End Agent Validation
-            </h1>
-            <p className="max-w-2xl text-sm text-slate-200/85">
-              Trigger orchestration runs, monitor durable state, submit approvals, and fire Logic App email tests from one
-              place.
-            </p>
-          </div>
+          <div className="relative flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
+            <div className="space-y-2">
+              <p className="text-xs uppercase tracking-[0.22em] text-cyan-200/80">Azure Cost Optimisation Agent</p>
+              <h1 className="font-display text-3xl leading-tight font-semibold text-white md:text-4xl">
+                Mission Control for Continuous Cost Wins
+              </h1>
+              <p className="max-w-2xl text-sm text-slate-200/85">
+                Launch the Azure Cost Optimisation Agent by resource group, watch durable execution in real time, and push
+                approvals through one polished control room.
+              </p>
+            </div>
           <div className="flex flex-wrap items-center gap-2">
             <Badge className="bg-cyan-300/20 text-cyan-100 border-cyan-300/30">
               <ShieldCheck className="mr-1 size-3.5" />
@@ -215,51 +216,54 @@ export default function Home() {
           <div className="grid gap-5 xl:grid-cols-[1.1fr_0.9fr]">
             <Card className="panel-glass noise-overlay">
               <CardHeader>
-                <CardTitle className="font-display text-xl">Start a cost optimisation run</CardTitle>
+                <CardTitle className="font-display text-xl">Launch an optimisation mission</CardTitle>
                 <CardDescription>
-                  Provide a resources array and optionally set a custom run ID for predictable re-tests.
+                  Enter a resource group and the agent will discover resources via the hosted Azure MCP server, then start the optimisation
+                  run automatically.
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
+                <Input
+                  placeholder="Resource group (e.g. rg-cost-optimiser)"
+                  value={resourceGroup}
+                  onChange={(event) => setResourceGroup(event.target.value)}
+                />
                 <Input
                   placeholder="Optional run ID (e.g. ui-regression-001)"
                   value={runId}
                   onChange={(event) => setRunId(event.target.value)}
                 />
-                <Textarea
-                  className="min-h-44 font-mono text-xs"
-                  value={resourcesText}
-                  onChange={(event) => setResourcesText(event.target.value)}
-                />
                 <div className="flex flex-wrap gap-2">
                   <Button
                     onClick={() =>
                       withUiGuard("start", async () => {
-                        const parsed = JSON.parse(resourcesText) as unknown;
-                        if (!Array.isArray(parsed)) {
-                          throw new Error("resources payload must be a JSON array.");
+                        if (!resourceGroup.trim()) {
+                          throw new Error("Resource group is required.");
                         }
-                        const payload = {
-                          user_id: "dashboard-user",
-                          resources: parsed,
-                          ...(runId.trim() ? { run_id: runId.trim() } : {}),
-                        };
-                        const outcome = await requestJson("/api/agent/report", {
+                        const outcome = await requestJson("/api/agent/report-by-group", {
                           method: "POST",
-                          body: JSON.stringify(payload),
+                          body: JSON.stringify({
+                            user_id: "dashboard-user",
+                            resource_group: resourceGroup.trim(),
+                            ...(runId.trim() ? { run_id: runId.trim() } : {}),
+                          }),
                         });
-                        const data = outcome.data as { instance_id?: string };
+                        const data = (outcome.data as StartByGroupResult) ?? {};
+                        setStartResult(data);
                         if (data.instance_id) {
                           setInstanceId(data.instance_id);
                         }
                         setStatusResult(null);
-                        setMessage(`Run started (${data.instance_id ?? "no instance returned"}).`);
+                        const discoveredCount = data.discovered?.resource_count ?? 0;
+                        setMessage(
+                          `Run started (${data.instance_id ?? "no instance returned"}). MCP discovered ${discoveredCount} resources.`,
+                        );
                       })
                     }
                     disabled={isWorking !== null}
                   >
                     <Play className="size-4" />
-                    Start run
+                    Launch optimisation run
                   </Button>
                   <Button
                     variant="secondary"
@@ -277,6 +281,19 @@ export default function Home() {
                   </Button>
                 </div>
                 <Separator />
+                <div className="space-y-2">
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-300/80">Discovery payload</p>
+                  <pre className="max-h-52 overflow-auto rounded-lg border bg-black/25 p-3 text-xs text-slate-100">
+                    {toPrettyJson(startResult?.discovered) ||
+                      "No discovery yet — enter a resource group and launch a run."}
+                  </pre>
+                </div>
+                <div className="space-y-2">
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-300/80">Discovered resources preview</p>
+                  <pre className="max-h-52 overflow-auto rounded-lg border bg-black/25 p-3 text-xs text-slate-100">
+                    {toPrettyJson(startResult?.discovered_preview) || "No resources discovered yet."}
+                  </pre>
+                </div>
                 <div className="space-y-2">
                   <p className="text-xs uppercase tracking-[0.2em] text-slate-300/80">Health payload</p>
                   <pre className="max-h-52 overflow-auto rounded-lg border bg-black/25 p-3 text-xs text-slate-100">
