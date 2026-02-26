@@ -6,6 +6,8 @@ agent-framework-durabletask==1.0.0b260210
 opentelemetry-semantic-conventions-ai==0.4.13
 azure-identity
 azure-mgmt-resource
+azure-mgmt-monitor
+azure-mgmt-advisor
 httpx
 httpx-sse
 python-dotenv

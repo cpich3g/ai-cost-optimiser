@@ -3,10 +3,10 @@
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import azure.functions as func
-from agent_framework._mcp import MCPTool
+from agent_framework._mcp import MCPTool, MCPStreamableHTTPTool
 from agent_framework.azure import AgentFunctionApp, AzureOpenAIChatClient
 from azure.identity import DefaultAzureCredential
 from mcp.client.sse import sse_client
@@ -17,10 +17,119 @@ from orchestrators.incident_response import register_orchestrator
 
 logger = logging.getLogger(__name__)
 
-_approval_state: dict[tuple[str, str], str] = {}
 _credential = DefaultAzureCredential()
 
 chat_client = AzureOpenAIChatClient(credential=_credential)
+
+
+# ---------------------------------------------------------------------------
+# Azure SDK helpers — direct monitoring data collection (bypasses MCP sampling)
+# ---------------------------------------------------------------------------
+
+def _gather_monitoring_data(subscription_id: str, resource_group: str, resources: list) -> dict:
+    """Gather Advisor recommendations, Activity Logs, and key metrics via Azure SDK."""
+    from azure.mgmt.advisor import AdvisorManagementClient
+    from azure.mgmt.monitor import MonitorManagementClient
+
+    advisor_client = AdvisorManagementClient(_credential, subscription_id)
+    monitor_client = MonitorManagementClient(_credential, subscription_id)
+
+    result = {"advisor_recommendations": [], "activity_logs": {}, "metrics": {}}
+
+    # 1. Advisor cost recommendations for the subscription
+    try:
+        recs = advisor_client.recommendations.list(filter="Category eq 'Cost'")
+        for rec in recs:
+            rid = ""
+            if rec.resource_metadata and rec.resource_metadata.resource_id:
+                rid = rec.resource_metadata.resource_id
+            # Include subscription-level recs (reserved instances) and RG-specific ones
+            impacted = getattr(rec, "impacted_field", "") or ""
+            result["advisor_recommendations"].append({
+                "resourceId": rid,
+                "impactedField": impacted,
+                "impactedValue": getattr(rec, "impacted_value", "") or "",
+                "category": str(rec.category),
+                "impact": str(rec.impact),
+                "problem": rec.short_description.problem if rec.short_description else "",
+                "solution": rec.short_description.solution if rec.short_description else "",
+            })
+    except Exception as exc:
+        logger.warning("Advisor query failed: %s", exc)
+
+    # 2. Activity Logs for the resource group (last 60 days)
+    now = datetime.now(timezone.utc)
+    start_time = now - timedelta(days=60)
+    try:
+        logs = monitor_client.activity_logs.list(
+            filter=(
+                f"eventTimestamp ge '{start_time.isoformat()}' "
+                f"and eventTimestamp le '{now.isoformat()}' "
+                f"and resourceGroupName eq '{resource_group}'"
+            ),
+        )
+        # Count events per resource
+        for log_entry in logs:
+            rid = log_entry.resource_id or ""
+            name = rid.split("/")[-1] if rid else "unknown"
+            if name not in result["activity_logs"]:
+                result["activity_logs"][name] = {"count": 0, "last_event": None}
+            result["activity_logs"][name]["count"] += 1
+            ts = log_entry.event_timestamp
+            if ts:
+                ts_str = ts.isoformat()
+                prev = result["activity_logs"][name]["last_event"]
+                if not prev or ts_str > prev:
+                    result["activity_logs"][name]["last_event"] = ts_str
+    except Exception as exc:
+        logger.warning("Activity Logs query failed: %s", exc)
+
+    # 3. Metrics for resources that support them
+    metrizable_types = {
+        "Microsoft.Compute/virtualMachines": "Percentage CPU",
+        "Microsoft.Web/sites": "CpuPercentage",
+        "Microsoft.Web/serverFarms": "CpuPercentage",
+        "Microsoft.Sql/servers/databases": "dtu_consumption_percent",
+        "Microsoft.Cache/Redis": "usedmemorypercentage",
+        "Microsoft.DocumentDb/databaseAccounts": "TotalRequests",
+        "Microsoft.CognitiveServices/accounts": "TotalCalls",
+        "Microsoft.Storage/storageAccounts": "Transactions",
+        "Microsoft.ContainerRegistry/registries": "TotalPullCount",
+    }
+    for res in resources:
+        rtype = res.get("type", "")
+        if rtype not in metrizable_types:
+            continue
+        metric_name = metrizable_types[rtype]
+        try:
+            # Azure Monitor requires ISO 8601 without space in tz offset
+            ts_start = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+            ts_end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            metrics_data = monitor_client.metrics.list(
+                resource_uri=res["id"],
+                timespan=f"{ts_start}/{ts_end}",
+                interval="P1D",
+                metricnames=metric_name,
+                aggregation="Average",
+            )
+            values = []
+            for m in metrics_data.value:
+                for ts_entry in m.timeseries:
+                    for dp in ts_entry.data:
+                        if dp.average is not None:
+                            values.append(dp.average)
+            if values:
+                result["metrics"][res["name"]] = {
+                    "metric": metric_name,
+                    "avg": round(sum(values) / len(values), 2),
+                    "max": round(max(values), 2),
+                    "min": round(min(values), 2),
+                    "datapoints": len(values),
+                }
+        except Exception as exc:
+            logger.warning("Metrics query failed for %s (%s): %s", res["name"], rtype, exc)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +161,6 @@ def _build_mcp_tool() -> MCPSSETool | None:
     if not mcp_url.endswith("/sse"):
         mcp_url = mcp_url.rstrip("/") + "/sse"
 
-    # Acquire MI token at startup for initial MCP tool config
     mcp_scope = os.getenv("MCP_SERVER_SCOPE", "").strip()
     headers = {}
     if mcp_scope:
@@ -73,16 +181,46 @@ def _build_mcp_tool() -> MCPSSETool | None:
     )
 
 
+def _build_mslearn_tool() -> MCPStreamableHTTPTool | None:
+    """Create an MCP tool for the Microsoft Learn documentation server."""
+    mslearn_url = os.getenv(
+        "MSLEARN_MCP_URL", "https://learn.microsoft.com/api/mcp"
+    ).strip()
+    if not mslearn_url:
+        return None
+    try:
+        return MCPStreamableHTTPTool(
+            name="mslearn-docs",
+            url=mslearn_url,
+            description="Microsoft Learn documentation — search Azure docs, best practices, and reference guides.",
+            request_timeout=30,
+            load_prompts=False,
+        )
+    except Exception as exc:
+        logger.warning("Failed to create MS Learn MCP tool: %s", exc)
+        return None
+
+
 mcp_tool = _build_mcp_tool()
+mslearn_tool = _build_mslearn_tool()
 
 analyzer_agent = chat_client.as_agent(
     name="CostOptimizerAnalyzer",
     instructions=(
-        "You are an Azure Cost Optimiser analyst. "
-        "Use your Azure MCP tools to discover resources in the specified resource group. "
-        "Then generate a JSON object with a recommendations array for cost actions. "
-        "Each recommendation must include: actionType (resize|deallocate|delete), "
-        "resourceId, riskLevel (low|medium|high|critical), estimatedSavingsMonthlyUsd, and reason."
+        "You are an Azure Cost Optimiser analyst. You receive:\n"
+        "1. A resource inventory (from ARM)\n"
+        "2. Monitoring data: Advisor cost recs, Activity Logs (event counts per resource), "
+        "and CPU/DTU/memory metrics (avg, min, max over 60 days)\n\n"
+        "Use this data to make precise recommendations:\n"
+        "- 'resize': Cite metrics (e.g. 'avg CPU 3.2%') or Advisor recommendation.\n"
+        "- 'deallocate': Cite <5% avg CPU or zero activity.\n"
+        "- 'delete': ONLY if 0 Activity Log events in 60 days (orphaned). Always state why safe.\n"
+        "- 'no action needed': Free-tier, essential infra, or healthy utilisation.\n\n"
+        "Every reason must cite specific data from the monitoring payload.\n"
+        "Estimate monthly savings using your Azure pricing knowledge.\n\n"
+        "Return JSON: {\"recommendations\": [{\"actionType\":\"...\",\"resourceId\":\"...\","
+        "\"riskLevel\":\"low|medium|high|critical\",\"estimatedSavingsMonthlyUsd\":0,"
+        "\"reason\":\"explanation citing monitoring data\"}]}"
     ),
     tools=[mcp_tool] if mcp_tool else [],
 )
@@ -95,8 +233,22 @@ executor_agent = chat_client.as_agent(
     ),
 )
 
+doc_research_agent = chat_client.as_agent(
+    name="DocResearchAgent",
+    instructions=(
+        "You are a documentation researcher for Azure cost optimisation. "
+        "Given a list of Azure cost actions and resource types, return the most relevant "
+        "Microsoft Learn documentation URLs. "
+        "Always return a JSON object: {\"docs\": [{\"title\":\"...\",\"url\":\"https://learn.microsoft.com/...\",\"relevance\":\"...\"}]}. "
+        "Include docs for: Azure Advisor cost recommendations, Azure cost management best practices, "
+        "resource-specific sizing/SKU guides, and how-to guides for each action type (resize, deallocate, delete). "
+        "Use ONLY real Microsoft Learn URLs that you are confident exist."
+    ),
+    tools=[],
+)
+
 app = AgentFunctionApp(
-    agents=[analyzer_agent, executor_agent],
+    agents=[analyzer_agent, executor_agent, doc_research_agent],
     enable_health_check=True,
 )
 
@@ -192,20 +344,45 @@ async def report_by_group(req: func.HttpRequest, client) -> func.HttpResponse:
             mimetype="application/json",
         )
 
-    # Step 2: Feed resource inventory to the analyzer agent for cost analysis
+    # Step 2: Gather monitoring data via Azure SDK (Advisor, Activity Logs, Metrics)
+    subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID", "db2cf8dd-6845-470c-84b4-1a3db9946d36")
+    try:
+        monitoring = _gather_monitoring_data(subscription_id, resource_group, resource_list)
+        logger.info(
+            "Monitoring data: %d advisor recs, %d resources with activity, %d with metrics",
+            len(monitoring["advisor_recommendations"]),
+            len(monitoring["activity_logs"]),
+            len(monitoring["metrics"]),
+        )
+    except Exception as exc:
+        logger.warning("Monitoring data gathering failed: %s", exc)
+        monitoring = {"advisor_recommendations": [], "activity_logs": {}, "metrics": {}}
+
+    # Step 3: Feed resource inventory + monitoring data to the analyzer agent
     resource_summary = json.dumps(resource_list, indent=2)
+    monitoring_summary = json.dumps(monitoring, indent=2)
     try:
         prompt = (
-            f"Below is the complete resource inventory for Azure resource group '{resource_group}'.\n\n"
-            f"```json\n{resource_summary}\n```\n\n"
-            f"Analyse each resource for cost optimisation opportunities. "
-            f"Return ONLY a JSON object with a 'recommendations' array where each item has:\n"
-            f"- actionType: resize | deallocate | delete\n"
-            f"- resourceId: the full Azure resource ID\n"
-            f"- riskLevel: low | medium | high | critical\n"
-            f"- estimatedSavingsMonthlyUsd: numeric estimate\n"
-            f"- reason: concise explanation\n"
-            f"Include all resources, even if the recommendation is 'no action needed' (use riskLevel 'low' with $0 savings)."
+            f"Analyse Azure resource group '{resource_group}' for cost optimisation.\n\n"
+            f"RESOURCE INVENTORY:\n```json\n{resource_summary}\n```\n\n"
+            f"MONITORING DATA (collected via Azure SDK):\n```json\n{monitoring_summary}\n```\n\n"
+            f"The monitoring data includes:\n"
+            f"- Azure Advisor cost recommendations (authoritative — act on these)\n"
+            f"- Activity Logs per resource (event count + last event date over 60 days)\n"
+            f"- CPU/DTU/memory metrics for compute resources (avg, min, max over 60 days)\n\n"
+            f"RULES:\n"
+            f"- If Advisor recommends an action for a resource, follow it and cite Advisor.\n"
+            f"- 'delete' ONLY if Activity Logs show 0 events over 60 days (truly orphaned).\n"
+            f"- 'resize' if metrics show <20% avg utilisation OR SKU is clearly oversized.\n"
+            f"- 'deallocate' if compute metrics show <5% avg CPU.\n"
+            f"- 'no action needed' for free-tier, essential infra, or healthy utilisation.\n"
+            f"- Cite actual data: 'Advisor recommends...', 'avg CPU 3.2% over 60d', "
+            f"'0 Activity Log events since <date>', 'current SKU S0 costs ~$X/mo'.\n\n"
+            f"Return ONLY JSON:\n"
+            f"{{\"recommendations\": [{{\"actionType\":\"...\",\"resourceId\":\"...\","
+            f"\"riskLevel\":\"low|medium|high|critical\",\"estimatedSavingsMonthlyUsd\":0,"
+            f"\"reason\":\"cite monitoring data or SKU analysis\"}}]}}\n"
+            f"Include ALL resources."
         )
         result = await analyzer_agent.run(prompt)
         agent_output = str(result)
@@ -253,7 +430,7 @@ async def report_by_group(req: func.HttpRequest, client) -> func.HttpResponse:
 @app.route(route="cost-optimization/{instanceId}/decide", methods=["POST"])
 @app.durable_client_input(client_name="client")
 async def submit_decision(req: func.HttpRequest, client) -> func.HttpResponse:
-    """Submit human decision for high-risk action batch."""
+    """Submit human decision for high-risk action batch (from dashboard UI)."""
     instance_id = req.route_params.get("instanceId")
     try:
         body = req.get_json()
@@ -272,18 +449,16 @@ async def submit_decision(req: func.HttpRequest, client) -> func.HttpResponse:
             mimetype="application/json",
         )
 
-    approval_id = body.get("approvalId")
-    stage = body.get("stage", "finance")
-    if approval_id:
-        _approval_state[(approval_id, stage)] = decision
+    stage = body.get("stage", "finance").lower()
+    event_name = "EngineeringDecision" if stage == "engineering" else "FinanceDecision"
 
     await client.raise_event(
         instance_id,
-        "ApprovalDecision",
+        event_name,
         {
             "decision": decision,
             "stage": stage,
-            "approvalId": approval_id,
+            "approvalId": body.get("approvalId", ""),
             "notes": body.get("notes", ""),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         },
@@ -293,6 +468,72 @@ async def submit_decision(req: func.HttpRequest, client) -> func.HttpResponse:
         body=json.dumps({"instance_id": instance_id, "decision": decision}),
         status_code=200,
         mimetype="application/json",
+    )
+
+
+@app.route(route="cost-optimization/{instanceId}/email-decide", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+@app.durable_client_input(client_name="client")
+async def email_decision(req: func.HttpRequest, client) -> func.HttpResponse:
+    """Handle approve/reject clicks from email links (GET with query params)."""
+    instance_id = req.route_params.get("instanceId")
+    decision = req.params.get("decision", "").lower()
+    function_key = req.params.get("key", "")
+    stage = req.params.get("stage", "finance").lower()
+
+    expected_key = os.getenv("APPROVAL_CALLBACK_SECRET", "dev-shared-secret")
+    if function_key != expected_key:
+        return func.HttpResponse(
+            body="<html><body><h2>Unauthorized</h2><p>Invalid approval link.</p></body></html>",
+            status_code=401,
+            mimetype="text/html",
+        )
+
+    if decision not in ("approve", "reject"):
+        return func.HttpResponse(
+            body="<html><body><h2>Invalid decision</h2><p>Use approve or reject.</p></body></html>",
+            status_code=400,
+            mimetype="text/html",
+        )
+
+    # Route to the correct durable event based on approval stage
+    event_name = "EngineeringDecision" if stage == "engineering" else "FinanceDecision"
+
+    try:
+        await client.raise_event(
+            instance_id,
+            event_name,
+            {
+                "decision": decision,
+                "stage": stage,
+                "notes": f"Decided via {stage} email link",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except Exception as exc:
+        logger.warning("raise_event failed for %s: %s", instance_id, exc)
+        return func.HttpResponse(
+            body=f"""<html><body style="font-family:Segoe UI,sans-serif;text-align:center;padding:60px">
+            <div style="font-size:64px">⏰</div>
+            <h1 style="color:#f59e0b">Link Expired</h1>
+            <p>The orchestration <strong>{instance_id}</strong> has already completed or expired.</p>
+            <p style="color:#888;font-size:14px">No action was taken. You can close this tab.</p>
+            </body></html>""",
+            status_code=200,
+            mimetype="text/html",
+        )
+
+    emoji = "✅" if decision == "approve" else "❌"
+    color = "#10b981" if decision == "approve" else "#ef4444"
+    stage_label = stage.capitalize()
+    return func.HttpResponse(
+        body=f"""<html><body style="font-family:Segoe UI,sans-serif;text-align:center;padding:60px">
+        <div style="font-size:64px">{emoji}</div>
+        <h1 style="color:{color}">{stage_label} Decision: {decision.upper()}</h1>
+        <p>Your {stage_label.lower()} decision for <strong>{instance_id}</strong> has been recorded.</p>
+        <p style="color:#888;font-size:14px">You can close this tab.</p>
+        </body></html>""",
+        status_code=200,
+        mimetype="text/html",
     )
 
 
@@ -322,25 +563,3 @@ async def get_status(req: func.HttpRequest, client) -> func.HttpResponse:
         mimetype="application/json",
     )
 
-
-@app.route(route="approvals/{approvalId}/{stage}", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
-async def get_logicapp_approval(req: func.HttpRequest) -> func.HttpResponse:
-    """Polled by Logic App to retrieve approval status for a stage."""
-    expected = os.getenv("APPROVAL_CALLBACK_SECRET", "dev-shared-secret")
-    token = req.headers.get("x-approval-token", "")
-    if token != expected:
-        return func.HttpResponse(
-            body=json.dumps({"error": "Unauthorized"}),
-            status_code=401,
-            mimetype="application/json",
-        )
-
-    approval_id = req.route_params.get("approvalId")
-    stage = req.route_params.get("stage")
-    decision = _approval_state.get((approval_id, stage), "pending")
-
-    return func.HttpResponse(
-        body=json.dumps({"approvalId": approval_id, "stage": stage, "decision": decision}),
-        status_code=200,
-        mimetype="application/json",
-    )

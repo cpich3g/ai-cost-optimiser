@@ -139,6 +139,16 @@ export default function Home() {
     return () => clearInterval(timer);
   }, [autoPoll, instanceId, refreshStatus]);
 
+  // Auto-switch decision stage based on orchestration status
+  useEffect(() => {
+    const stage = (statusResult?.custom_status as Record<string, unknown>)?.stage;
+    if (stage === "awaiting_engineering") {
+      setDecisionStage("engineering");
+    } else if (stage === "awaiting_finance") {
+      setDecisionStage("finance");
+    }
+  }, [statusResult]);
+
   const runtimeBadgeVariant = useMemo(() => {
     const value = runtimeStatus.toLowerCase();
     if (value.includes("completed")) {

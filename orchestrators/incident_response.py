@@ -1,4 +1,7 @@
-"""Durable orchestration for Azure Cost Optimiser with HITL approval."""
+"""Durable orchestration for Azure Cost Optimiser with two-stage HITL approval.
+
+Flow: Analysis → Engineering Approval → Finance Approval → Dry Run → Doc Lookup → Summary Email
+"""
 
 from __future__ import annotations
 
@@ -28,25 +31,30 @@ def _extract_json(text: str) -> dict:
 
 
 def _fallback_recommendations(resources: list[dict]) -> list[dict]:
+    """Heuristic fallback when the analyzer agent fails to return valid JSON.
+
+    Never recommends 'delete' because we lack activity/usage data to confirm
+    60-day inactivity. Sticks to resize and deallocate which are reversible.
+    """
     recommendations: list[dict] = []
     for item in resources:
         resource_id = item.get("resource_id") or item.get("id") or "unknown-resource"
         cost = float(item.get("monthly_cost", 0) or 0)
-        if cost >= 250:
-            action_type = "delete"
-            risk = "high"
-            savings = round(cost * 0.7, 2)
-            reason = "High recurring cost candidate."
-        elif cost >= 100:
+        if cost >= 200:
             action_type = "resize"
             risk = "medium"
             savings = round(cost * 0.35, 2)
-            reason = "Likely oversized based on spend profile."
-        else:
-            action_type = "deallocate"
+            reason = "High recurring cost — likely oversized. Review SKU/tier."
+        elif cost >= 50:
+            action_type = "resize"
             risk = "low"
             savings = round(cost * 0.2, 2)
-            reason = "Low activity candidate for deallocation."
+            reason = "Moderate spend — may benefit from right-sizing."
+        else:
+            action_type = "no action needed"
+            risk = "low"
+            savings = 0
+            reason = "Low cost — no optimisation needed."
 
         recommendations.append(
             {
@@ -60,22 +68,51 @@ def _fallback_recommendations(resources: list[dict]) -> list[dict]:
     return recommendations
 
 
+def _wait_for_decision(context, event_name: str):
+    """Yield a (decision_data, timed_out) tuple from external event or timeout."""
+    approval_event = context.wait_for_external_event(event_name)
+    timeout_task = context.create_timer(
+        context.current_utc_datetime + timedelta(hours=APPROVAL_TIMEOUT_HOURS)
+    )
+    winner = yield context.task_any([approval_event, timeout_task])
+
+    if winner == timeout_task:
+        return None  # timed out
+
+    timeout_task.cancel()
+    raw_result = approval_event.result
+    if isinstance(raw_result, str):
+        try:
+            return json.loads(raw_result)
+        except (json.JSONDecodeError, TypeError):
+            return {"decision": raw_result}
+    elif isinstance(raw_result, dict):
+        return raw_result
+    return {}
+
+
 def register_orchestrator(app):
     """Register orchestrator and execution activities to the function app."""
 
     @app.activity_trigger(input_name="action")
     def execute_cost_action(action: dict) -> dict:
+        """Dry-run execution — logs intent without modifying Azure resources."""
+        action_type = action.get("actionType", "unknown")
+        resource_id = action.get("resourceId", "")
+        resource_name = resource_id.rsplit("/", 1)[-1] if "/" in resource_id else resource_id
         return {
-            "resourceId": action.get("resourceId"),
-            "actionType": action.get("actionType"),
-            "status": "success",
-            "details": "Executed in scaffold mode.",
+            "resourceId": resource_id,
+            "resourceName": resource_name,
+            "actionType": action_type,
+            "status": "dry_run",
+            "details": f"[DRY RUN] Would {action_type} {resource_name}. No changes made.",
         }
 
     @app.orchestration_trigger(context_name="context")
     def cost_optimization_orchestrator(context):
         input_data = context.get_input() or {}
         resources = input_data.get("resources", [])
+        resource_group = input_data.get("resource_group", "unknown")
         run_id = input_data.get("run_id", context.instance_id)
         user_id = input_data.get("user_id", "operator")
 
@@ -90,94 +127,156 @@ def register_orchestrator(app):
                 },
             )
 
+        # --- Stage 1: Analysis ---
+        # Use pre-computed analysis from HTTP endpoint (MCP tools can't run
+        # inside durable context due to Content serialization bug).
         context.set_custom_status({"stage": "analyzing", "run_id": run_id})
         yield notify("analysis_started", {"resourceCount": len(resources)})
 
-        analyzer = app.get_agent(context, "CostOptimizerAnalyzer")
-        analyzer_thread = analyzer.get_new_thread()
-        analysis_prompt = (
-            "Analyze Azure resources and propose cost actions with risk levels.\n"
-            f"Resources:\n{json.dumps(resources)}\n\n"
-            "Return JSON only: {\"recommendations\": [{\"actionType\":\"resize|deallocate|delete\","
-            "\"resourceId\":\"...\",\"riskLevel\":\"low|medium|high|critical\","
-            "\"estimatedSavingsMonthlyUsd\":123.45,\"reason\":\"...\"}]}"
-        )
-        analysis_response = yield analyzer.run(messages=analysis_prompt, thread=analyzer_thread)
+        pre_analysis = input_data.get("agent_analysis", "")
+        recommendations = []
+        if pre_analysis:
+            try:
+                recommendations = _extract_json(pre_analysis).get("recommendations", [])
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                recommendations = []
 
-        analysis_text = analysis_response.text if analysis_response else ""
-        try:
-            recommendations = _extract_json(analysis_text).get("recommendations", [])
-        except (json.JSONDecodeError, TypeError, AttributeError):
+        if not recommendations:
             recommendations = _fallback_recommendations(resources)
 
-        high_risk_actions = [
-            item
-            for item in recommendations
-            if str(item.get("riskLevel", "")).lower() in ("high", "critical")
-            or str(item.get("actionType", "")).lower() == "delete"
+        # Filter out "no action needed" for approval flow
+        actionable = [
+            r for r in recommendations
+            if str(r.get("actionType", "")).lower() not in ("no action needed", "none", "")
         ]
-        auto_actions = [item for item in recommendations if item not in high_risk_actions]
-        approved_actions = list(auto_actions)
+        if not actionable:
+            context.set_custom_status({"stage": "completed", "run_id": run_id})
+            result = {
+                "status": "completed",
+                "run_id": run_id,
+                "message": "No actionable cost optimisations found.",
+                "recommendationCount": len(recommendations),
+            }
+            yield notify("orchestration_completed", result)
+            return result
 
-        if high_risk_actions:
-            context.set_custom_status(
-                {
-                    "stage": "awaiting_approval",
-                    "run_id": run_id,
-                    "highRiskActionCount": len(high_risk_actions),
-                }
-            )
-            yield notify(
-                "approval_required",
-                {"actions": high_risk_actions, "timeoutHours": APPROVAL_TIMEOUT_HOURS},
-            )
+        total_savings = round(
+            sum(float(a.get("estimatedSavingsMonthlyUsd", 0) or 0) for a in actionable), 2
+        )
 
-            approval_event = context.wait_for_external_event("ApprovalDecision")
-            timeout_task = context.create_timer(
-                context.current_utc_datetime + timedelta(hours=APPROVAL_TIMEOUT_HOURS)
-            )
-            winner = yield context.task_any([approval_event, timeout_task])
+        # --- Stage 2: Engineering Approval ---
+        context.set_custom_status({
+            "stage": "awaiting_engineering",
+            "run_id": run_id,
+            "actionCount": len(actionable),
+        })
+        yield notify(
+            "approval_required",
+            {
+                "actions": actionable,
+                "allRecommendations": recommendations,
+                "resourceGroup": resource_group,
+                "stage": "engineering",
+                "timeoutHours": APPROVAL_TIMEOUT_HOURS,
+            },
+        )
 
-            if winner == timeout_task:
-                context.set_custom_status({"stage": "expired", "run_id": run_id})
-                yield notify("approval_expired", {"run_id": run_id})
-                return {"status": "expired", "run_id": run_id}
+        eng_decision = yield from _wait_for_decision(context, "EngineeringDecision")
+        if eng_decision is None:
+            context.set_custom_status({"stage": "expired", "run_id": run_id})
+            yield notify("approval_expired", {"run_id": run_id, "stage": "engineering"})
+            return {"status": "expired", "run_id": run_id, "stage": "engineering"}
+        if eng_decision.get("decision") != "approve":
+            context.set_custom_status({"stage": "rejected", "run_id": run_id})
+            yield notify("approval_rejected", {"run_id": run_id, "stage": "engineering"})
+            return {"status": "rejected", "run_id": run_id, "stage": "engineering"}
 
-            timeout_task.cancel()
-            approval_data = approval_event.result if isinstance(approval_event.result, dict) else {}
-            if approval_data.get("decision") != "approve":
-                context.set_custom_status({"stage": "rejected", "run_id": run_id})
-                yield notify("approval_rejected", {"run_id": run_id})
-                return {"status": "rejected", "run_id": run_id}
+        # --- Stage 3: Finance Approval ---
+        context.set_custom_status({
+            "stage": "awaiting_finance",
+            "run_id": run_id,
+            "estimatedSavingsMonthlyUsd": total_savings,
+        })
+        yield notify(
+            "approval_required",
+            {
+                "actions": actionable,
+                "allRecommendations": recommendations,
+                "resourceGroup": resource_group,
+                "stage": "finance",
+                "timeoutHours": APPROVAL_TIMEOUT_HOURS,
+            },
+        )
 
-            approved_actions.extend(high_risk_actions)
+        fin_decision = yield from _wait_for_decision(context, "FinanceDecision")
+        if fin_decision is None:
+            context.set_custom_status({"stage": "expired", "run_id": run_id})
+            yield notify("approval_expired", {"run_id": run_id, "stage": "finance"})
+            return {"status": "expired", "run_id": run_id, "stage": "finance"}
+        if fin_decision.get("decision") != "approve":
+            context.set_custom_status({"stage": "rejected", "run_id": run_id})
+            yield notify("approval_rejected", {"run_id": run_id, "stage": "finance"})
+            return {"status": "rejected", "run_id": run_id, "stage": "finance"}
 
-        context.set_custom_status({"stage": "executing", "run_id": run_id})
+        # --- Stage 4: Dry Run Execution ---
+        context.set_custom_status({"stage": "executing_dry_run", "run_id": run_id})
         results = []
-        for index, action in enumerate(approved_actions, start=1):
+        for index, action in enumerate(actionable, start=1):
             yield notify(
                 "action_started",
-                {"index": index, "total": len(approved_actions), "action": action},
+                {"index": index, "total": len(actionable), "action": action},
             )
             result = yield context.call_activity("execute_cost_action", action)
             results.append(result)
             yield notify(
                 "action_completed",
-                {"index": index, "total": len(approved_actions), "result": result},
+                {"index": index, "total": len(actionable), "result": result},
             )
 
-        total_savings = round(
-            sum(float(item.get("estimatedSavingsMonthlyUsd", 0) or 0) for item in approved_actions),
-            2,
-        )
+        # --- Stage 5: Doc Lookup via MS Learn MCP ---
+        context.set_custom_status({"stage": "researching_docs", "run_id": run_id})
+        doc_links = []
+        try:
+            doc_agent = app.get_agent(context, "DocResearchAgent")
+            doc_thread = doc_agent.get_new_thread()
+            action_types_seen = list({a.get("actionType", "") for a in actionable})
+            resource_types_seen = list({
+                a.get("resourceId", "").split("/providers/")[-1].split("/")[0] + "/" +
+                a.get("resourceId", "").split("/providers/")[-1].split("/")[1]
+                for a in actionable
+                if len(a.get("resourceId", "").split("/providers/")) > 1
+                and len(a.get("resourceId", "").split("/providers/")[-1].split("/")) >= 2
+            })
+            doc_prompt = (
+                "Find relevant Microsoft Learn documentation links for Azure cost optimisation.\n"
+                f"Action types performed: {json.dumps(action_types_seen)}\n"
+                f"Azure resource types involved: {json.dumps(resource_types_seen)}\n\n"
+                "Return JSON only: {\"docs\": [{\"title\":\"...\",\"url\":\"https://learn.microsoft.com/...\","
+                "\"relevance\":\"...\"}]}\n"
+                "Include docs for: best practices for each action type, resource-specific sizing guides, "
+                "Azure cost management overview, and Azure Advisor recommendations."
+            )
+            doc_response = yield doc_agent.run(messages=doc_prompt, thread=doc_thread)
+            doc_text = doc_response.text if doc_response else ""
+            doc_links = _extract_json(doc_text).get("docs", [])
+        except Exception:
+            # Fallback: agent knowledge without MCP is still useful
+            doc_links = []
+
+        # --- Stage 6: Summary Email to Both ---
+        context.set_custom_status({"stage": "sending_summary", "run_id": run_id})
         final_result = {
             "status": "completed",
             "run_id": run_id,
+            "resourceGroup": resource_group,
             "recommendationCount": len(recommendations),
-            "approvedActionCount": len(approved_actions),
+            "actionableCount": len(actionable),
             "estimatedSavingsMonthlyUsd": total_savings,
             "results": results,
+            "docLinks": doc_links,
         }
+        yield notify("execution_summary", final_result)
+
         context.set_custom_status({"stage": "completed", **final_result})
         yield notify("orchestration_completed", final_result)
         return final_result
