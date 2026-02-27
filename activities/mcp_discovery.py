@@ -25,7 +25,7 @@ RESOURCE_ID_RE = re.compile(
 )
 
 DEFAULT_MCP_URL = (
-    "https://ca-azure-mcp-server.greenground-a1172782.swedencentral.azurecontainerapps.io"
+    ""
 )
 
 

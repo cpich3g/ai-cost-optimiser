@@ -4,13 +4,13 @@ approvalPolicy:
     - stage: finance
       required: true
       timeoutHours: 24
-      approverGroup: justinjoy@microsoft.com
+      approverGroup: user@example.com
       onReject: stop
       onExpire: stop
     - stage: engineering
       required: true
       timeoutHours: 24
-      approverGroup: justinjoy@microsoft.com
+      approverGroup: user@example.com
       onReject: stop
       onExpire: stop
   payloadContract:

@@ -142,8 +142,8 @@ def _build_engineering_email(instance_id: str, data: dict) -> dict:
     total_savings = round(
         sum(float(a.get("estimatedSavingsMonthlyUsd", 0) or 0) for a in actions), 2
     )
-    func_base = os.getenv("WEBSITE_HOSTNAME", "func-cost-optimiser-flex8029.azurewebsites.net")
-    key = os.getenv("APPROVAL_CALLBACK_SECRET", "dev-shared-secret")
+    func_base = os.getenv("WEBSITE_HOSTNAME", "your-function-app.azurewebsites.net")
+    key = os.getenv("APPROVAL_CALLBACK_SECRET", "<your-secret-token>")
     callback = f"https://{func_base}/api/cost-optimization/{instance_id}/email-decide"
 
     risk_counts = {}
@@ -194,7 +194,7 @@ def _build_engineering_email(instance_id: str, data: dict) -> dict:
     )
 
     return {
-        "to": os.getenv("ENGINEERING_EMAIL", "justinjoy@microsoft.com"),
+        "to": os.getenv("ENGINEERING_EMAIL", "user@example.com"),
         "subject": f"🔧 Engineering Review — {len(actions)} actions for {rg} (${total_savings}/mo savings)",
         "htmlBody": body,
     }
@@ -211,8 +211,8 @@ def _build_finance_email(instance_id: str, data: dict) -> dict:
         sum(float(a.get("estimatedSavingsMonthlyUsd", 0) or 0) for a in actions), 2
     )
     annual_savings = round(total_savings * 12, 2)
-    func_base = os.getenv("WEBSITE_HOSTNAME", "func-cost-optimiser-flex8029.azurewebsites.net")
-    key = os.getenv("APPROVAL_CALLBACK_SECRET", "dev-shared-secret")
+    func_base = os.getenv("WEBSITE_HOSTNAME", "your-function-app.azurewebsites.net")
+    key = os.getenv("APPROVAL_CALLBACK_SECRET", "<your-secret-token>")
     callback = f"https://{func_base}/api/cost-optimization/{instance_id}/email-decide"
 
     # Group savings by action type
@@ -256,7 +256,7 @@ def _build_finance_email(instance_id: str, data: dict) -> dict:
     )
 
     return {
-        "to": os.getenv("FINANCE_EMAIL", "justinjoy@microsoft.com"),
+        "to": os.getenv("FINANCE_EMAIL", "user@example.com"),
         "subject": f"💰 Finance Approval — ${total_savings}/mo savings for {rg}",
         "htmlBody": body,
     }
@@ -418,7 +418,7 @@ def _build_digest_email(instance_id: str, data: dict) -> dict:
     )
 
     return {
-        "to": os.getenv("DIGEST_RECIPIENT_EMAIL", "justinjoy@microsoft.com"),
+        "to": os.getenv("DIGEST_RECIPIENT_EMAIL", "user@example.com"),
         "subject": f"📊 Daily Azure Cost Digest — ${total_savings:,.2f}/mo savings across {rg_count} RGs",
         "htmlBody": body,
     }
@@ -511,8 +511,8 @@ def _build_summary_email(instance_id: str, data: dict) -> dict:
     )
 
     # Send to both engineering and finance
-    eng = os.getenv("ENGINEERING_EMAIL", "justinjoy@microsoft.com")
-    fin = os.getenv("FINANCE_EMAIL", "justinjoy@microsoft.com")
+    eng = os.getenv("ENGINEERING_EMAIL", "user@example.com")
+    fin = os.getenv("FINANCE_EMAIL", "user@example.com")
     to_list = eng if eng == fin else f"{eng};{fin}"
 
     return {

@@ -2,7 +2,7 @@
 
 import os
 
-APPROVAL_CALLBACK_SECRET = os.getenv("APPROVAL_CALLBACK_SECRET", "dev-shared-secret")
+APPROVAL_CALLBACK_SECRET = os.getenv("APPROVAL_CALLBACK_SECRET", "<your-secret-token>")
 SIGNALR_HUB_NAME = os.getenv("SIGNALR_HUB_NAME", "costoptimiser")
 SIGNALR_CONNECTION_SETTING = os.getenv("SIGNALR_CONNECTION_SETTING", "AzureSignalRConnectionString")
 APPROVAL_TIMEOUT_HOURS = int(os.getenv("APPROVAL_TIMEOUT_HOURS", "24"))
@@ -17,11 +17,11 @@ ENABLE_MCP_TOOLS = os.getenv("ENABLE_MCP_TOOLS", "false").lower() in ("true", "1
 # Hosted Azure MCP server (resource discovery via MI)
 MCP_SERVER_URL = os.getenv(
     "MCP_SERVER_URL",
-    "https://ca-azure-mcp-server.greenground-a1172782.swedencentral.azurecontainerapps.io",
+    "",
 )
 MCP_SERVER_SCOPE = os.getenv("MCP_SERVER_SCOPE", "")
 
 # Daily digest settings
 DAILY_DIGEST_CRON = os.getenv("DAILY_DIGEST_CRON", "0 0 8 * * *")  # 8 AM UTC daily
-DIGEST_RECIPIENT_EMAIL = os.getenv("DIGEST_RECIPIENT_EMAIL", "justinjoy@microsoft.com")
-AZURE_SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID", "db2cf8dd-6845-470c-84b4-1a3db9946d36")
+DIGEST_RECIPIENT_EMAIL = os.getenv("DIGEST_RECIPIENT_EMAIL", "user@example.com")
+AZURE_SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID", "00000000-0000-0000-0000-000000000000")

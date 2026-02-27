@@ -52,7 +52,7 @@ def _parse_utc(value: str | None) -> datetime | None:
 
 
 def validate_callback_guard(headers: Mapping[str, str], expected_secret: str | None = None) -> bool:
-    expected = expected_secret or os.getenv("APPROVAL_CALLBACK_SECRET", "dev-shared-secret")
+    expected = expected_secret or os.getenv("APPROVAL_CALLBACK_SECRET", "<your-secret-token>")
     if not expected:
         return False
 

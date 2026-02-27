@@ -4,11 +4,11 @@
     "FUNCTIONS_WORKER_RUNTIME": "python",
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
     "AZURE_CLIENT_ID": "",
-    "AZURE_OPENAI_ENDPOINT": "https://ai-justinjoy-4099.openai.azure.com/",
+    "AZURE_OPENAI_ENDPOINT": "https://your-openai-resource.openai.azure.com/",
     "AZURE_OPENAI_CHAT_DEPLOYMENT_NAME": "<your-chat-deployment>",
     "AZURE_OPENAI_API_VERSION": "2024-10-21",
     "APPROVAL_TIMEOUT_HOURS": "24",
-    "APPROVAL_CALLBACK_SECRET": "dev-shared-secret",
+    "APPROVAL_CALLBACK_SECRET": "<your-secret-token>",
     "SIGNALR_HUB_NAME": "costoptimiser",
     "AzureSignalRConnectionString": "<your-signalr-connection-string>",
     "ENABLE_MCP_TOOLS": "false"

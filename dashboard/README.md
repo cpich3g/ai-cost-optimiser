@@ -28,7 +28,7 @@ Open `http://localhost:3000`.
 Authenticate your local identity for hosted MCP access (one-time per session):
 
 ```bash
-az login --tenant 16b3c013-d300-468d-ac64-7eda0820b6d3 --scope 60a93168-daca-48be-9866-3e1e07c792f3/Mcp.Tools.ReadWrite
+az login --tenant {your-tenant-id} --scope {your-mcp-scope-id}/Mcp.Tools.ReadWrite
 ```
 
 1. Enter only the **resource group** and click **Discover + start run**.

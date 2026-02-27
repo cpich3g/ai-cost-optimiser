@@ -318,7 +318,7 @@ async def report_by_group(req: func.HttpRequest, client) -> func.HttpResponse:
     try:
         arm_client = ResourceManagementClient(_credential, os.getenv(
             "AZURE_SUBSCRIPTION_ID",
-            "db2cf8dd-6845-470c-84b4-1a3db9946d36",
+            "00000000-0000-0000-0000-000000000000",
         ))
         raw_resources = list(arm_client.resources.list_by_resource_group(resource_group))
         resource_list = [
@@ -347,7 +347,7 @@ async def report_by_group(req: func.HttpRequest, client) -> func.HttpResponse:
         )
 
     # Step 2: Gather monitoring data via Azure SDK (Advisor, Activity Logs, Metrics)
-    subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID", "db2cf8dd-6845-470c-84b4-1a3db9946d36")
+    subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID", "00000000-0000-0000-0000-000000000000")
     try:
         monitoring = _gather_monitoring_data(subscription_id, resource_group, resource_list)
         logger.info(
@@ -482,7 +482,7 @@ async def email_decision(req: func.HttpRequest, client) -> func.HttpResponse:
     function_key = req.params.get("key", "")
     stage = req.params.get("stage", "finance").lower()
 
-    expected_key = os.getenv("APPROVAL_CALLBACK_SECRET", "dev-shared-secret")
+    expected_key = os.getenv("APPROVAL_CALLBACK_SECRET", "<your-secret-token>")
     if function_key != expected_key:
         return func.HttpResponse(
             body="<html><body><h2>Unauthorized</h2><p>Invalid approval link.</p></body></html>",

@@ -112,7 +112,7 @@ export default function Home() {
   const [autoPoll, setAutoPoll] = useState(true);
 
   const runtimeStatus = statusResult?.runtime_status ?? "not started";
-  const approvalDestination = process.env.NEXT_PUBLIC_APPROVAL_RECIPIENT ?? "justinjoy@microsoft.com";
+  const approvalDestination = process.env.NEXT_PUBLIC_APPROVAL_RECIPIENT ?? "user@example.com";
 
   const refreshStatus = useCallback(
     async (targetId?: string) => {

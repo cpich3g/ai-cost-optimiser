@@ -7,7 +7,7 @@
     instances to prevent non-deterministic replay errors and phantom email loops.
 
 .PARAMETER FunctionAppName
-    Name of the Azure Function App (default: func-cost-optimiser-flex8029)
+    Name of the Azure Function App (default: your-function-app)
 
 .PARAMETER ResourceGroup
     Resource group containing the Function App (default: rg-cost-optimiser)
@@ -22,7 +22,7 @@
 #>
 
 param(
-    [string]$FunctionAppName = "func-cost-optimiser-flex8029",
+    [string]$FunctionAppName = "your-function-app",
     [string]$ResourceGroup = "rg-cost-optimiser",
     [switch]$SkipPurge
 )
