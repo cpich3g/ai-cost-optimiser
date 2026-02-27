@@ -136,7 +136,7 @@ Open `http://localhost:3000`.
 
 Finance and engineering approval emails are currently configured to:
 
-- `justinjoy@microsoft.com`
+- `cpich3g@contoso.com`
 
 ## Workflow
 
