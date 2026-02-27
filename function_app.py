@@ -345,14 +345,48 @@ async def report_cost_optimization(req: func.HttpRequest, client) -> func.HttpRe
         )
 
     resources = payload.get("resources", [])
+
+    # Validate resources list
+    if not isinstance(resources, list):
+        return func.HttpResponse(
+            body=json.dumps({"error": "resources must be a list"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    # Limit resources to prevent DoS
+    if len(resources) > 1000:
+        return func.HttpResponse(
+            body=json.dumps({"error": "resources list too large (max 1000)"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
     run_id = payload.get("run_id") or f"costopt-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+
+    # Validate run_id format if provided
+    if payload.get("run_id") and not _validate_instance_id(run_id):
+        return func.HttpResponse(
+            body=json.dumps({"error": "Invalid run_id format"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    # Validate user_id
+    user_id = payload.get("user_id", "operator")
+    if len(user_id) > 100:
+        return func.HttpResponse(
+            body=json.dumps({"error": "user_id too long (max 100 characters)"}),
+            status_code=400,
+            mimetype="application/json",
+        )
 
     instance_id = await client.start_new(
         "cost_optimization_orchestrator",
         instance_id=run_id,
         client_input={
             "run_id": run_id,
-            "user_id": payload.get("user_id", "operator"),
+            "user_id": user_id,
             "resources": resources,
         },
     )
@@ -511,6 +545,15 @@ async def report_by_group(req: func.HttpRequest, client) -> func.HttpResponse:
 async def submit_decision(req: func.HttpRequest, client) -> func.HttpResponse:
     """Submit human decision for high-risk action batch (from dashboard UI)."""
     instance_id = req.route_params.get("instanceId")
+
+    # Validate instance_id
+    if not instance_id or not _validate_instance_id(instance_id):
+        return func.HttpResponse(
+            body=json.dumps({"error": "Invalid instance_id format"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
     try:
         body = req.get_json()
     except ValueError:
@@ -520,7 +563,7 @@ async def submit_decision(req: func.HttpRequest, client) -> func.HttpResponse:
             mimetype="application/json",
         )
 
-    decision = body.get("decision")
+    decision = body.get("decision", "").lower()
     if decision not in ("approve", "reject"):
         return func.HttpResponse(
             body=json.dumps({"error": "decision must be 'approve' or 'reject'"}),
@@ -701,6 +744,32 @@ async def trigger_digest(req: func.HttpRequest, client) -> func.HttpResponse:
 
     # Allow filtering to specific RGs, or scan all
     rg_filter = payload.get("resource_groups", [])
+
+    # Validate resource_groups format
+    if not isinstance(rg_filter, list):
+        return func.HttpResponse(
+            body=json.dumps({"error": "resource_groups must be a list"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    # Limit number of resource groups to prevent DoS
+    if len(rg_filter) > 100:
+        return func.HttpResponse(
+            body=json.dumps({"error": "resource_groups list too large (max 100)"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    # Validate each resource group name
+    for rg in rg_filter:
+        if not isinstance(rg, str) or not _validate_resource_group_name(rg):
+            return func.HttpResponse(
+                body=json.dumps({"error": f"Invalid resource group name: {rg}"}),
+                status_code=400,
+                mimetype="application/json",
+            )
+
     if not rg_filter:
         try:
             arm = ResourceManagementClient(_credential, subscription_id)
@@ -713,6 +782,14 @@ async def trigger_digest(req: func.HttpRequest, client) -> func.HttpResponse:
             )
 
     run_id = payload.get("run_id") or f"digest-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+
+    # Validate run_id format if provided
+    if payload.get("run_id") and not _validate_instance_id(run_id):
+        return func.HttpResponse(
+            body=json.dumps({"error": "Invalid run_id format"}),
+            status_code=400,
+            mimetype="application/json",
+        )
 
     await client.start_new(
         "daily_digest_orchestrator",
