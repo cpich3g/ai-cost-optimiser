@@ -106,10 +106,27 @@ def register_digest_orchestrator(app):
                     "recommendations. Every reason must cite specific data."
                 ),
             )
-            result = asyncio.get_event_loop().run_until_complete(agent.run(prompt))
+
+            # Activities may run in sync or async context depending on worker version
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                # Already in async context — use nest_asyncio or thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    result = pool.submit(
+                        lambda: asyncio.run(agent.run(prompt))
+                    ).result(timeout=120)
+            else:
+                result = asyncio.run(agent.run(prompt))
+
             recs = _extract_json(str(result)).get("recommendations", [])
+            logger.info("Digest analysis for %s: %d recommendations", rg, len(recs))
         except Exception as exc:
-            logger.warning("Agent analysis failed for %s: %s", rg, exc)
+            logger.error("Agent analysis failed for %s: %s: %s", rg, type(exc).__name__, exc, exc_info=True)
             recs = []
 
         actionable = [
