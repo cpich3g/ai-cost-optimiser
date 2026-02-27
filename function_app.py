@@ -58,8 +58,13 @@ def _validate_instance_id(instance_id: str) -> bool:
 # Azure SDK helpers — direct monitoring data collection (bypasses MCP sampling)
 # ---------------------------------------------------------------------------
 
-def _gather_monitoring_data(subscription_id: str, resource_group: str, resources: list) -> dict:
-    """Gather Advisor recommendations, Activity Logs, and key metrics via Azure SDK."""
+async def _gather_monitoring_data(subscription_id: str, resource_group: str, resources: list) -> dict:
+    """Gather Advisor recommendations, Activity Logs, and key metrics via Azure SDK.
+
+    Uses asyncio to parallelize API calls for improved performance.
+    """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
     from azure.mgmt.advisor import AdvisorManagementClient
     from azure.mgmt.monitor import MonitorManagementClient
 
@@ -68,73 +73,67 @@ def _gather_monitoring_data(subscription_id: str, resource_group: str, resources
 
     result = {"advisor_recommendations": [], "activity_logs": {}, "metrics": {}}
 
-    # 1. Advisor cost recommendations for the subscription
-    try:
-        recs = advisor_client.recommendations.list(filter="Category eq 'Cost'")
-        for rec in recs:
-            rid = ""
-            if rec.resource_metadata and rec.resource_metadata.resource_id:
-                rid = rec.resource_metadata.resource_id
-            # Include subscription-level recs (reserved instances) and RG-specific ones
-            impacted = getattr(rec, "impacted_field", "") or ""
-            result["advisor_recommendations"].append({
-                "resourceId": rid,
-                "impactedField": impacted,
-                "impactedValue": getattr(rec, "impacted_value", "") or "",
-                "category": str(rec.category),
-                "impact": str(rec.impact),
-                "problem": rec.short_description.problem if rec.short_description else "",
-                "solution": rec.short_description.solution if rec.short_description else "",
-            })
-    except Exception as exc:
-        logger.warning("Advisor query failed: %s", exc)
+    # Run Advisor, Activity Logs, and Metrics queries in parallel using thread pool
+    # (Azure SDK clients are sync, so we use threads to parallelize)
+    loop = asyncio.get_event_loop()
 
-    # 2. Activity Logs for the resource group (last 60 days)
-    now = datetime.now(timezone.utc)
-    start_time = now - timedelta(days=60)
-    try:
-        logs = monitor_client.activity_logs.list(
-            filter=(
-                f"eventTimestamp ge '{start_time.isoformat()}' "
-                f"and eventTimestamp le '{now.isoformat()}' "
-                f"and resourceGroupName eq '{resource_group}'"
-            ),
-        )
-        # Count events per resource
-        for log_entry in logs:
-            rid = log_entry.resource_id or ""
-            name = rid.split("/")[-1] if rid else "unknown"
-            if name not in result["activity_logs"]:
-                result["activity_logs"][name] = {"count": 0, "last_event": None}
-            result["activity_logs"][name]["count"] += 1
-            ts = log_entry.event_timestamp
-            if ts:
-                ts_str = ts.isoformat()
-                prev = result["activity_logs"][name]["last_event"]
-                if not prev or ts_str > prev:
-                    result["activity_logs"][name]["last_event"] = ts_str
-    except Exception as exc:
-        logger.warning("Activity Logs query failed: %s", exc)
-
-    # 3. Metrics for resources that support them
-    metrizable_types = {
-        "Microsoft.Compute/virtualMachines": "Percentage CPU",
-        "Microsoft.Web/sites": "CpuPercentage",
-        "Microsoft.Web/serverFarms": "CpuPercentage",
-        "Microsoft.Sql/servers/databases": "dtu_consumption_percent",
-        "Microsoft.Cache/Redis": "usedmemorypercentage",
-        "Microsoft.DocumentDb/databaseAccounts": "TotalRequests",
-        "Microsoft.CognitiveServices/accounts": "TotalCalls",
-        "Microsoft.Storage/storageAccounts": "Transactions",
-        "Microsoft.ContainerRegistry/registries": "TotalPullCount",
-    }
-    for res in resources:
-        rtype = res.get("type", "")
-        if rtype not in metrizable_types:
-            continue
-        metric_name = metrizable_types[rtype]
+    def _get_advisor_recommendations():
+        """Fetch Advisor cost recommendations."""
+        recs_list = []
         try:
-            # Azure Monitor requires ISO 8601 without space in tz offset
+            recs = advisor_client.recommendations.list(filter="Category eq 'Cost'")
+            for rec in recs:
+                rid = ""
+                if rec.resource_metadata and rec.resource_metadata.resource_id:
+                    rid = rec.resource_metadata.resource_id
+                impacted = getattr(rec, "impacted_field", "") or ""
+                recs_list.append({
+                    "resourceId": rid,
+                    "impactedField": impacted,
+                    "impactedValue": getattr(rec, "impacted_value", "") or "",
+                    "category": str(rec.category),
+                    "impact": str(rec.impact),
+                    "problem": rec.short_description.problem if rec.short_description else "",
+                    "solution": rec.short_description.solution if rec.short_description else "",
+                })
+        except Exception as exc:
+            logger.warning("Advisor query failed: %s", exc)
+        return recs_list
+
+    def _get_activity_logs():
+        """Fetch Activity Logs for the resource group."""
+        logs_dict = {}
+        now = datetime.now(timezone.utc)
+        start_time = now - timedelta(days=60)
+        try:
+            logs = monitor_client.activity_logs.list(
+                filter=(
+                    f"eventTimestamp ge '{start_time.isoformat()}' "
+                    f"and eventTimestamp le '{now.isoformat()}' "
+                    f"and resourceGroupName eq '{resource_group}'"
+                ),
+            )
+            for log_entry in logs:
+                rid = log_entry.resource_id or ""
+                name = rid.split("/")[-1] if rid else "unknown"
+                if name not in logs_dict:
+                    logs_dict[name] = {"count": 0, "last_event": None}
+                logs_dict[name]["count"] += 1
+                ts = log_entry.event_timestamp
+                if ts:
+                    ts_str = ts.isoformat()
+                    prev = logs_dict[name]["last_event"]
+                    if not prev or ts_str > prev:
+                        logs_dict[name]["last_event"] = ts_str
+        except Exception as exc:
+            logger.warning("Activity Logs query failed: %s", exc)
+        return logs_dict
+
+    def _get_metrics_for_resource(res, metric_name):
+        """Fetch metrics for a single resource."""
+        now = datetime.now(timezone.utc)
+        start_time = now - timedelta(days=60)
+        try:
             ts_start = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
             ts_end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             metrics_data = monitor_client.metrics.list(
@@ -151,15 +150,58 @@ def _gather_monitoring_data(subscription_id: str, resource_group: str, resources
                         if dp.average is not None:
                             values.append(dp.average)
             if values:
-                result["metrics"][res["name"]] = {
+                # Compute stats in single pass for efficiency
+                total = sum(values)
+                count = len(values)
+                return {
+                    "name": res["name"],
                     "metric": metric_name,
-                    "avg": round(sum(values) / len(values), 2),
+                    "avg": round(total / count, 2),
                     "max": round(max(values), 2),
                     "min": round(min(values), 2),
-                    "datapoints": len(values),
+                    "datapoints": count,
                 }
         except Exception as exc:
-            logger.warning("Metrics query failed for %s (%s): %s", res["name"], rtype, exc)
+            logger.warning("Metrics query failed for %s (%s): %s", res["name"], res.get("type"), exc)
+        return None
+
+    # Parallelize the three main queries
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        # Submit Advisor and Activity Logs tasks
+        advisor_future = loop.run_in_executor(executor, _get_advisor_recommendations)
+        activity_logs_future = loop.run_in_executor(executor, _get_activity_logs)
+
+        # Submit metrics tasks for each metrizable resource
+        metrizable_types = {
+            "Microsoft.Compute/virtualMachines": "Percentage CPU",
+            "Microsoft.Web/sites": "CpuPercentage",
+            "Microsoft.Web/serverFarms": "CpuPercentage",
+            "Microsoft.Sql/servers/databases": "dtu_consumption_percent",
+            "Microsoft.Cache/Redis": "usedmemorypercentage",
+            "Microsoft.DocumentDb/databaseAccounts": "TotalRequests",
+            "Microsoft.CognitiveServices/accounts": "TotalCalls",
+            "Microsoft.Storage/storageAccounts": "Transactions",
+            "Microsoft.ContainerRegistry/registries": "TotalPullCount",
+        }
+
+        metrics_futures = []
+        for res in resources:
+            rtype = res.get("type", "")
+            if rtype in metrizable_types:
+                metric_name = metrizable_types[rtype]
+                metrics_futures.append(
+                    loop.run_in_executor(executor, _get_metrics_for_resource, res, metric_name)
+                )
+
+        # Wait for all tasks to complete
+        result["advisor_recommendations"] = await advisor_future
+        result["activity_logs"] = await activity_logs_future
+
+        if metrics_futures:
+            metrics_results = await asyncio.gather(*metrics_futures)
+            for metric_result in metrics_results:
+                if metric_result:
+                    result["metrics"][metric_result["name"]] = metric_result
 
     return result
 
@@ -383,9 +425,8 @@ async def report_by_group(req: func.HttpRequest, client) -> func.HttpResponse:
         )
 
     # Step 2: Gather monitoring data via Azure SDK (Advisor, Activity Logs, Metrics)
-    subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID", "00000000-0000-0000-0000-000000000000")
     try:
-        monitoring = _gather_monitoring_data(subscription_id, resource_group, resource_list)
+        monitoring = await _gather_monitoring_data(config.AZURE_SUBSCRIPTION_ID, resource_group, resource_list)
         logger.info(
             "Monitoring data: %d advisor recs, %d resources with activity, %d with metrics",
             len(monitoring["advisor_recommendations"]),
