@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.40.2.10011",
-      "templateHash": "11560788011759704255"
+      "templateHash": "12727575492353066488"
     }
   },
   "parameters": {
@@ -39,16 +39,25 @@
         "description": "Token used by Logic App when calling approval callback endpoint."
       }
     },
+    "deployAIFoundry": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Set to true to deploy a new Azure AI Foundry (OpenAI) resource and GPT-4.1 model. Set to false if you already have one."
+      }
+    },
     "azureOpenAiEndpoint": {
       "type": "string",
+      "defaultValue": "",
       "metadata": {
-        "description": "Azure OpenAI endpoint URL (for example: https://<name>.openai.azure.com/)."
+        "description": "Azure OpenAI endpoint URL. Required when deployAIFoundry is false."
       }
     },
     "azureOpenAiChatDeploymentName": {
       "type": "string",
+      "defaultValue": "gpt-4.1",
       "metadata": {
-        "description": "Azure OpenAI chat deployment name."
+        "description": "Azure OpenAI chat deployment name. Required when deployAIFoundry is false."
       }
     },
     "approvalTimeoutHours": {
@@ -57,18 +66,78 @@
       "metadata": {
         "description": "Approval timeout in hours for orchestration logic."
       }
+    },
+    "digestRecipientEmail": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Email address for daily digest recipient."
+      }
+    },
+    "engineeringEmail": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Email address for engineering approval notifications."
+      }
+    },
+    "financeEmail": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Email address for finance approval notifications."
+      }
     }
   },
   "variables": {
     "storageAccountName": "[toLower(format('st{0}', uniqueString(resourceGroup().id, parameters('functionAppName'))))]",
     "appServicePlanName": "[format('asp-{0}', parameters('functionAppName'))]",
     "appInsightsName": "[format('appi-{0}', parameters('functionAppName'))]",
+    "aiAccountName": "[format('ai-costopt-{0}', uniqueString(resourceGroup().id))]",
     "storageBlobDataOwnerRoleId": "b7e6dc6d-f1e8-4753-8033-0f276bb0955b",
     "storageQueueDataContributorRoleId": "974c5e8b-45b9-4653-ba55-5f855dd0fb88",
     "storageTableDataContributorRoleId": "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3",
-    "storageAccountContributorRoleId": "17d1049b-9a84-46fb-8f53-869881c3d3ab"
+    "storageAccountContributorRoleId": "17d1049b-9a84-46fb-8f53-869881c3d3ab",
+    "cognitiveServicesOpenAiUserId": "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd",
+    "readerRoleId": "acdd72a7-3385-48ef-bd42-f606fba81ae7",
+    "resolvedDeploymentName": "[if(parameters('deployAIFoundry'), 'gpt-4dot1', parameters('azureOpenAiChatDeploymentName'))]"
   },
   "resources": [
+    {
+      "condition": "[parameters('deployAIFoundry')]",
+      "type": "Microsoft.CognitiveServices/accounts",
+      "apiVersion": "2024-10-01",
+      "name": "[variables('aiAccountName')]",
+      "location": "[parameters('location')]",
+      "kind": "OpenAI",
+      "sku": {
+        "name": "S0"
+      },
+      "properties": {
+        "customSubDomainName": "[variables('aiAccountName')]",
+        "publicNetworkAccess": "Enabled"
+      }
+    },
+    {
+      "condition": "[parameters('deployAIFoundry')]",
+      "type": "Microsoft.CognitiveServices/accounts/deployments",
+      "apiVersion": "2024-10-01",
+      "name": "[format('{0}/{1}', variables('aiAccountName'), 'gpt-4dot1')]",
+      "sku": {
+        "name": "GlobalStandard",
+        "capacity": 30
+      },
+      "properties": {
+        "model": {
+          "format": "OpenAI",
+          "name": "gpt-4.1",
+          "version": "2025-04-14"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', variables('aiAccountName'))]"
+      ]
+    },
     {
       "type": "Microsoft.Storage/storageAccounts",
       "apiVersion": "2023-05-01",
@@ -103,10 +172,10 @@
       "name": "[variables('appServicePlanName')]",
       "location": "[parameters('location')]",
       "sku": {
-        "name": "Y1",
-        "tier": "Dynamic"
+        "name": "B1",
+        "tier": "Basic"
       },
-      "kind": "functionapp",
+      "kind": "linux",
       "properties": {
         "reserved": true
       }
@@ -126,6 +195,7 @@
         "siteConfig": {
           "linuxFxVersion": "Python|3.11",
           "minTlsVersion": "1.2",
+          "alwaysOn": true,
           "appSettings": [
             {
               "name": "FUNCTIONS_WORKER_RUNTIME",
@@ -157,15 +227,35 @@
             },
             {
               "name": "AZURE_OPENAI_ENDPOINT",
-              "value": "[parameters('azureOpenAiEndpoint')]"
+              "value": "[if(parameters('deployAIFoundry'), reference(resourceId('Microsoft.CognitiveServices/accounts', variables('aiAccountName')), '2024-10-01').endpoint, parameters('azureOpenAiEndpoint'))]"
             },
             {
               "name": "AZURE_OPENAI_CHAT_DEPLOYMENT_NAME",
-              "value": "[parameters('azureOpenAiChatDeploymentName')]"
+              "value": "[variables('resolvedDeploymentName')]"
             },
             {
               "name": "APPROVAL_TIMEOUT_HOURS",
               "value": "[string(parameters('approvalTimeoutHours'))]"
+            },
+            {
+              "name": "APPROVAL_CALLBACK_SECRET",
+              "value": "[parameters('callbackToken')]"
+            },
+            {
+              "name": "DIGEST_RECIPIENT_EMAIL",
+              "value": "[parameters('digestRecipientEmail')]"
+            },
+            {
+              "name": "ENGINEERING_EMAIL",
+              "value": "[parameters('engineeringEmail')]"
+            },
+            {
+              "name": "FINANCE_EMAIL",
+              "value": "[parameters('financeEmail')]"
+            },
+            {
+              "name": "AZURE_SUBSCRIPTION_ID",
+              "value": "[subscription().subscriptionId]"
             },
             {
               "name": "SCM_DO_BUILD_DURING_DEPLOYMENT",
@@ -175,6 +265,7 @@
         }
       },
       "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', variables('aiAccountName'))]",
         "[resourceId('Microsoft.Insights/components', variables('appInsightsName'))]",
         "[resourceId('Microsoft.Web/serverfarms', variables('appServicePlanName'))]",
         "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
@@ -241,6 +332,22 @@
       ]
     },
     {
+      "condition": "[parameters('deployAIFoundry')]",
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.CognitiveServices/accounts', variables('aiAccountName'))]",
+      "name": "[guid(resourceId('Microsoft.CognitiveServices/accounts', variables('aiAccountName')), resourceId('Microsoft.Web/sites', parameters('functionAppName')), variables('cognitiveServicesOpenAiUserId'))]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.Web/sites', parameters('functionAppName')), '2023-12-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('cognitiveServicesOpenAiUserId'))]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', variables('aiAccountName'))]",
+        "[resourceId('Microsoft.Web/sites', parameters('functionAppName'))]"
+      ]
+    },
+    {
       "type": "Microsoft.Resources/deployments",
       "apiVersion": "2025-04-01",
       "name": "approval-logicapp",
@@ -273,7 +380,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.40.2.10011",
-              "templateHash": "13320279911337989415"
+              "templateHash": "11790578382542177202"
             }
           },
           "parameters": {
@@ -300,14 +407,9 @@
               "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
               "contentVersion": "1.0.0.0",
               "parameters": {
-                "o365ConnectionName": {
-                  "type": "String"
-                },
-                "callbackApiBaseUrl": {
-                  "type": "String"
-                },
-                "callbackToken": {
-                  "type": "SecureString"
+                "$connections": {
+                  "type": "Object",
+                  "defaultValue": {}
                 }
               },
               "triggers": {
@@ -318,50 +420,19 @@
                     "schema": {
                       "type": "object",
                       "required": [
-                        "approvalId",
-                        "batchId",
-                        "stage",
-                        "deadline",
-                        "riskSummary"
+                        "to",
+                        "subject",
+                        "htmlBody"
                       ],
                       "properties": {
-                        "approvalId": {
+                        "to": {
                           "type": "string"
                         },
-                        "batchId": {
+                        "subject": {
                           "type": "string"
                         },
-                        "stage": {
-                          "type": "string",
-                          "enum": [
-                            "finance",
-                            "engineering"
-                          ]
-                        },
-                        "deadline": {
-                          "type": "string",
-                          "format": "date-time"
-                        },
-                        "riskSummary": {
-                          "type": "object",
-                          "required": [
-                            "level",
-                            "score"
-                          ],
-                          "properties": {
-                            "level": {
-                              "type": "string"
-                            },
-                            "score": {
-                              "type": "number"
-                            },
-                            "reasons": {
-                              "type": "array",
-                              "items": {
-                                "type": "string"
-                              }
-                            }
-                          }
+                        "htmlBody": {
+                          "type": "string"
                         }
                       }
                     }
@@ -369,141 +440,37 @@
                 }
               },
               "actions": {
-                "Send_Finance_Approval_Email": {
+                "Send_Email": {
                   "runAfter": {},
                   "type": "ApiConnection",
                   "inputs": {
                     "host": {
                       "connection": {
-                        "name": "@parameters('o365ConnectionName')"
+                        "name": "@parameters('$connections')['office365']['connectionId']"
                       }
                     },
                     "method": "post",
                     "path": "/v2/Mail",
                     "body": {
-                      "To": "justinjoy@microsoft.com",
-                      "Subject": "Finance approval required: @{triggerBody()?['batchId']}",
-                      "Body": "Please review approval @{triggerBody()?['approvalId']}. Risk level: @{triggerBody()?['riskSummary']?['level']}."
+                      "To": "@{triggerBody()?['to']}",
+                      "Subject": "@{triggerBody()?['subject']}",
+                      "Body": "@{triggerBody()?['htmlBody']}",
+                      "IsHtml": true
                     }
                   }
                 },
-                "Wait_For_Finance_Decision": {
-                  "type": "Http",
+                "Respond_Accepted": {
+                  "type": "Response",
+                  "kind": "Http",
                   "runAfter": {
-                    "Send_Finance_Approval_Email": [
+                    "Send_Email": [
                       "Succeeded"
                     ]
                   },
                   "inputs": {
-                    "method": "GET",
-                    "uri": "@{concat(parameters('callbackApiBaseUrl'), '/approvals/', triggerBody()?['approvalId'], '/finance')}",
-                    "headers": {
-                      "x-approval-token": "@parameters('callbackToken')"
-                    }
-                  }
-                },
-                "Finance_Approved": {
-                  "type": "If",
-                  "runAfter": {
-                    "Wait_For_Finance_Decision": [
-                      "Succeeded"
-                    ]
-                  },
-                  "expression": {
-                    "equals": [
-                      "@body('Wait_For_Finance_Decision')?['decision']",
-                      "approve"
-                    ]
-                  },
-                  "actions": {
-                    "Send_Engineering_Approval_Email": {
-                      "type": "ApiConnection",
-                      "inputs": {
-                        "host": {
-                          "connection": {
-                            "name": "@parameters('o365ConnectionName')"
-                          }
-                        },
-                        "method": "post",
-                        "path": "/v2/Mail",
-                        "body": {
-                          "To": "justinjoy@microsoft.com",
-                          "Subject": "Engineering approval required: @{triggerBody()?['batchId']}",
-                          "Body": "Finance approved. Please review approval @{triggerBody()?['approvalId']}."
-                        }
-                      }
-                    },
-                    "Wait_For_Engineering_Decision": {
-                      "type": "Http",
-                      "runAfter": {
-                        "Send_Engineering_Approval_Email": [
-                          "Succeeded"
-                        ]
-                      },
-                      "inputs": {
-                        "method": "GET",
-                        "uri": "@{concat(parameters('callbackApiBaseUrl'), '/approvals/', triggerBody()?['approvalId'], '/engineering')}",
-                        "headers": {
-                          "x-approval-token": "@parameters('callbackToken')"
-                        }
-                      }
-                    },
-                    "Engineering_Approved": {
-                      "type": "If",
-                      "runAfter": {
-                        "Wait_For_Engineering_Decision": [
-                          "Succeeded"
-                        ]
-                      },
-                      "expression": {
-                        "equals": [
-                          "@body('Wait_For_Engineering_Decision')?['decision']",
-                          "approve"
-                        ]
-                      },
-                      "actions": {
-                        "Complete_Approved": {
-                          "type": "Response",
-                          "kind": "Http",
-                          "inputs": {
-                            "statusCode": 200,
-                            "body": {
-                              "approvalId": "@{triggerBody()?['approvalId']}",
-                              "decision": "approve"
-                            }
-                          }
-                        }
-                      },
-                      "else": {
-                        "actions": {
-                          "Complete_Rejected_At_Engineering": {
-                            "type": "Response",
-                            "kind": "Http",
-                            "inputs": {
-                              "statusCode": 200,
-                              "body": {
-                                "approvalId": "@{triggerBody()?['approvalId']}",
-                                "decision": "reject"
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  },
-                  "else": {
-                    "actions": {
-                      "Complete_Rejected_At_Finance": {
-                        "type": "Response",
-                        "kind": "Http",
-                        "inputs": {
-                          "statusCode": 200,
-                          "body": {
-                            "approvalId": "@{triggerBody()?['approvalId']}",
-                            "decision": "reject"
-                          }
-                        }
-                      }
+                    "statusCode": 202,
+                    "body": {
+                      "status": "email_sent"
                     }
                   }
                 }
@@ -511,6 +478,18 @@
             }
           },
           "resources": [
+            {
+              "type": "Microsoft.Web/connections",
+              "apiVersion": "2016-06-01",
+              "name": "[parameters('o365ConnectionName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "displayName": "Office 365 Connection",
+                "api": {
+                  "id": "[subscriptionResourceId('Microsoft.Web/locations/managedApis', parameters('location'), 'office365')]"
+                }
+              }
+            },
             {
               "type": "Microsoft.Logic/workflows",
               "apiVersion": "2019-05-01",
@@ -523,8 +502,14 @@
                 "state": "Enabled",
                 "definition": "[variables('$fxv#0')]",
                 "parameters": {
-                  "o365ConnectionName": {
-                    "value": "[parameters('o365ConnectionName')]"
+                  "$connections": {
+                    "value": {
+                      "office365": {
+                        "connectionId": "[resourceId('Microsoft.Web/connections', parameters('o365ConnectionName'))]",
+                        "connectionName": "[parameters('o365ConnectionName')]",
+                        "id": "[subscriptionResourceId('Microsoft.Web/locations/managedApis', parameters('location'), 'office365')]"
+                      }
+                    }
                   },
                   "callbackApiBaseUrl": {
                     "value": "[parameters('callbackApiBaseUrl')]"
@@ -533,7 +518,10 @@
                     "value": "[parameters('callbackToken')]"
                   }
                 }
-              }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Web/connections', parameters('o365ConnectionName'))]"
+              ]
             }
           ],
           "outputs": {
@@ -562,6 +550,10 @@
       "type": "string",
       "value": "[reference(resourceId('Microsoft.Web/sites', parameters('functionAppName')), '2023-12-01', 'full').identity.principalId]"
     },
+    "functionAppUrl": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.Web/sites', parameters('functionAppName')), '2023-12-01').defaultHostName)]"
+    },
     "logicAppResourceId": {
       "type": "string",
       "value": "[reference(resourceId('Microsoft.Resources/deployments', 'approval-logicapp'), '2025-04-01').outputs.logicAppResourceId.value]"
@@ -569,6 +561,14 @@
     "logicAppPrincipalId": {
       "type": "string",
       "value": "[reference(resourceId('Microsoft.Resources/deployments', 'approval-logicapp'), '2025-04-01').outputs.logicAppPrincipalId.value]"
+    },
+    "openAiEndpoint": {
+      "type": "string",
+      "value": "[if(parameters('deployAIFoundry'), reference(resourceId('Microsoft.CognitiveServices/accounts', variables('aiAccountName')), '2024-10-01').endpoint, parameters('azureOpenAiEndpoint'))]"
+    },
+    "openAiDeploymentName": {
+      "type": "string",
+      "value": "[variables('resolvedDeploymentName')]"
     }
   }
 }
