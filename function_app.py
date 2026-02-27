@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 import azure.functions as func
@@ -21,6 +22,36 @@ logger = logging.getLogger(__name__)
 _credential = DefaultAzureCredential()
 
 chat_client = AzureOpenAIChatClient(credential=_credential)
+
+
+# ---------------------------------------------------------------------------
+# Input validation helpers
+# ---------------------------------------------------------------------------
+
+def _validate_resource_group_name(name: str) -> bool:
+    """Validate Azure resource group name format.
+
+    Azure resource group names must:
+    - Be 1-90 characters
+    - Only contain alphanumerics, underscores, parentheses, hyphens, periods
+    - Not end with period
+    """
+    if not name or len(name) > 90:
+        return False
+    if name.endswith('.'):
+        return False
+    # Azure resource group name pattern
+    pattern = r'^[a-zA-Z0-9._()-]+$'
+    return bool(re.match(pattern, name))
+
+
+def _validate_instance_id(instance_id: str) -> bool:
+    """Validate durable orchestration instance ID format."""
+    if not instance_id or len(instance_id) > 256:
+        return False
+    # Allow alphanumerics, hyphens, underscores
+    pattern = r'^[a-zA-Z0-9_-]+$'
+    return bool(re.match(pattern, instance_id))
 
 
 # ---------------------------------------------------------------------------
@@ -312,14 +343,19 @@ async def report_by_group(req: func.HttpRequest, client) -> func.HttpResponse:
             mimetype="application/json",
         )
 
+    # Validate resource group name format to prevent injection
+    if not _validate_resource_group_name(resource_group):
+        return func.HttpResponse(
+            body=json.dumps({"error": "Invalid resource_group name format"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
     # Step 1: Discover resources using Azure Resource Management (MI-based)
     from azure.mgmt.resource import ResourceManagementClient
 
     try:
-        arm_client = ResourceManagementClient(_credential, os.getenv(
-            "AZURE_SUBSCRIPTION_ID",
-            "00000000-0000-0000-0000-000000000000",
-        ))
+        arm_client = ResourceManagementClient(_credential, config.AZURE_SUBSCRIPTION_ID)
         raw_resources = list(arm_client.resources.list_by_resource_group(resource_group))
         resource_list = [
             {
@@ -477,12 +513,14 @@ async def submit_decision(req: func.HttpRequest, client) -> func.HttpResponse:
 @app.durable_client_input(client_name="client")
 async def email_decision(req: func.HttpRequest, client) -> func.HttpResponse:
     """Handle approve/reject clicks from email links (GET with query params)."""
+    import html
+
     instance_id = req.route_params.get("instanceId")
     decision = req.params.get("decision", "").lower()
     function_key = req.params.get("key", "")
     stage = req.params.get("stage", "finance").lower()
 
-    expected_key = os.getenv("APPROVAL_CALLBACK_SECRET", "<your-secret-token>")
+    expected_key = config.APPROVAL_CALLBACK_SECRET
     if function_key != expected_key:
         return func.HttpResponse(
             body="<html><body><h2>Unauthorized</h2><p>Invalid approval link.</p></body></html>",
@@ -513,11 +551,13 @@ async def email_decision(req: func.HttpRequest, client) -> func.HttpResponse:
         )
     except Exception as exc:
         logger.warning("raise_event failed for %s: %s", instance_id, exc)
+        # HTML-escape instance_id to prevent XSS
+        safe_instance_id = html.escape(instance_id or "unknown")
         return func.HttpResponse(
             body=f"""<html><body style="font-family:Segoe UI,sans-serif;text-align:center;padding:60px">
             <div style="font-size:64px">⏰</div>
             <h1 style="color:#f59e0b">Link Expired</h1>
-            <p>The orchestration <strong>{instance_id}</strong> has already completed or expired.</p>
+            <p>The orchestration <strong>{safe_instance_id}</strong> has already completed or expired.</p>
             <p style="color:#888;font-size:14px">No action was taken. You can close this tab.</p>
             </body></html>""",
             status_code=200,
@@ -527,11 +567,13 @@ async def email_decision(req: func.HttpRequest, client) -> func.HttpResponse:
     emoji = "✅" if decision == "approve" else "❌"
     color = "#10b981" if decision == "approve" else "#ef4444"
     stage_label = stage.capitalize()
+    # HTML-escape instance_id to prevent XSS
+    safe_instance_id = html.escape(instance_id or "unknown")
     return func.HttpResponse(
         body=f"""<html><body style="font-family:Segoe UI,sans-serif;text-align:center;padding:60px">
         <div style="font-size:64px">{emoji}</div>
         <h1 style="color:{color}">{stage_label} Decision: {decision.upper()}</h1>
-        <p>Your {stage_label.lower()} decision for <strong>{instance_id}</strong> has been recorded.</p>
+        <p>Your {stage_label.lower()} decision for <strong>{safe_instance_id}</strong> has been recorded.</p>
         <p style="color:#888;font-size:14px">You can close this tab.</p>
         </body></html>""",
         status_code=200,
