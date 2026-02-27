@@ -6,28 +6,10 @@ Flow: Analysis → Engineering Approval → Finance Approval → Dry Run → Doc
 from __future__ import annotations
 
 import json
-import re
 from datetime import timedelta
 
 from config import APPROVAL_TIMEOUT_HOURS
-
-
-def _extract_json(text: str) -> dict:
-    stripped = text.strip()
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        pass
-
-    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", stripped, re.DOTALL)
-    if fence_match:
-        return json.loads(fence_match.group(1).strip())
-
-    object_match = re.search(r"\{.*\}", stripped, re.DOTALL)
-    if object_match:
-        return json.loads(object_match.group(0))
-
-    raise json.JSONDecodeError("No JSON object found", stripped, 0)
+from . import extract_json
 
 
 def _fallback_recommendations(resources: list[dict]) -> list[dict]:
@@ -137,7 +119,7 @@ def register_orchestrator(app):
         recommendations = []
         if pre_analysis:
             try:
-                recommendations = _extract_json(pre_analysis).get("recommendations", [])
+                recommendations = extract_json(pre_analysis).get("recommendations", [])
             except (json.JSONDecodeError, TypeError, AttributeError):
                 recommendations = []
 
@@ -258,7 +240,7 @@ def register_orchestrator(app):
             )
             doc_response = yield doc_agent.run(messages=doc_prompt, thread=doc_thread)
             doc_text = doc_response.text if doc_response else ""
-            doc_links = _extract_json(doc_text).get("docs", [])
+            doc_links = extract_json(doc_text).get("docs", [])
         except Exception:
             # Fallback: agent knowledge without MCP is still useful
             doc_links = []

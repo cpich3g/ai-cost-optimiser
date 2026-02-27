@@ -7,22 +7,8 @@ Fan-in:  aggregate results and send a single consolidated digest email.
 from __future__ import annotations
 
 import json
-import re
 
-
-def _extract_json(text: str) -> dict:
-    stripped = text.strip()
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        pass
-    fence = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", stripped, re.DOTALL)
-    if fence:
-        return json.loads(fence.group(1).strip())
-    obj = re.search(r"\{.*\}", stripped, re.DOTALL)
-    if obj:
-        return json.loads(obj.group(0))
-    raise json.JSONDecodeError("No JSON object found", stripped, 0)
+from . import extract_json
 
 
 def register_digest_orchestrator(app):
@@ -123,7 +109,7 @@ def register_digest_orchestrator(app):
             else:
                 result = asyncio.run(agent.run(prompt))
 
-            recs = _extract_json(str(result)).get("recommendations", [])
+            recs = extract_json(str(result)).get("recommendations", [])
             logger.info("Digest analysis for %s: %d recommendations", rg, len(recs))
         except Exception as exc:
             logger.error("Agent analysis failed for %s: %s: %s", rg, type(exc).__name__, exc, exc_info=True)

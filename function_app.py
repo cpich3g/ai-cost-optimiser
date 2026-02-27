@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 import azure.functions as func
@@ -24,11 +25,46 @@ chat_client = AzureOpenAIChatClient(credential=_credential)
 
 
 # ---------------------------------------------------------------------------
+# Input validation helpers
+# ---------------------------------------------------------------------------
+
+def _validate_resource_group_name(name: str) -> bool:
+    """Validate Azure resource group name format.
+
+    Azure resource group names must:
+    - Be 1-90 characters
+    - Only contain alphanumerics, underscores, parentheses, hyphens, periods
+    - Not end with period
+    """
+    if not name or len(name) > 90:
+        return False
+    if name.endswith('.'):
+        return False
+    # Azure resource group name pattern
+    pattern = r'^[a-zA-Z0-9._()-]+$'
+    return bool(re.match(pattern, name))
+
+
+def _validate_instance_id(instance_id: str) -> bool:
+    """Validate durable orchestration instance ID format."""
+    if not instance_id or len(instance_id) > 256:
+        return False
+    # Allow alphanumerics, hyphens, underscores
+    pattern = r'^[a-zA-Z0-9_-]+$'
+    return bool(re.match(pattern, instance_id))
+
+
+# ---------------------------------------------------------------------------
 # Azure SDK helpers — direct monitoring data collection (bypasses MCP sampling)
 # ---------------------------------------------------------------------------
 
-def _gather_monitoring_data(subscription_id: str, resource_group: str, resources: list) -> dict:
-    """Gather Advisor recommendations, Activity Logs, and key metrics via Azure SDK."""
+async def _gather_monitoring_data(subscription_id: str, resource_group: str, resources: list) -> dict:
+    """Gather Advisor recommendations, Activity Logs, and key metrics via Azure SDK.
+
+    Uses asyncio to parallelize API calls for improved performance.
+    """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
     from azure.mgmt.advisor import AdvisorManagementClient
     from azure.mgmt.monitor import MonitorManagementClient
 
@@ -37,73 +73,67 @@ def _gather_monitoring_data(subscription_id: str, resource_group: str, resources
 
     result = {"advisor_recommendations": [], "activity_logs": {}, "metrics": {}}
 
-    # 1. Advisor cost recommendations for the subscription
-    try:
-        recs = advisor_client.recommendations.list(filter="Category eq 'Cost'")
-        for rec in recs:
-            rid = ""
-            if rec.resource_metadata and rec.resource_metadata.resource_id:
-                rid = rec.resource_metadata.resource_id
-            # Include subscription-level recs (reserved instances) and RG-specific ones
-            impacted = getattr(rec, "impacted_field", "") or ""
-            result["advisor_recommendations"].append({
-                "resourceId": rid,
-                "impactedField": impacted,
-                "impactedValue": getattr(rec, "impacted_value", "") or "",
-                "category": str(rec.category),
-                "impact": str(rec.impact),
-                "problem": rec.short_description.problem if rec.short_description else "",
-                "solution": rec.short_description.solution if rec.short_description else "",
-            })
-    except Exception as exc:
-        logger.warning("Advisor query failed: %s", exc)
+    # Run Advisor, Activity Logs, and Metrics queries in parallel using thread pool
+    # (Azure SDK clients are sync, so we use threads to parallelize)
+    loop = asyncio.get_event_loop()
 
-    # 2. Activity Logs for the resource group (last 60 days)
-    now = datetime.now(timezone.utc)
-    start_time = now - timedelta(days=60)
-    try:
-        logs = monitor_client.activity_logs.list(
-            filter=(
-                f"eventTimestamp ge '{start_time.isoformat()}' "
-                f"and eventTimestamp le '{now.isoformat()}' "
-                f"and resourceGroupName eq '{resource_group}'"
-            ),
-        )
-        # Count events per resource
-        for log_entry in logs:
-            rid = log_entry.resource_id or ""
-            name = rid.split("/")[-1] if rid else "unknown"
-            if name not in result["activity_logs"]:
-                result["activity_logs"][name] = {"count": 0, "last_event": None}
-            result["activity_logs"][name]["count"] += 1
-            ts = log_entry.event_timestamp
-            if ts:
-                ts_str = ts.isoformat()
-                prev = result["activity_logs"][name]["last_event"]
-                if not prev or ts_str > prev:
-                    result["activity_logs"][name]["last_event"] = ts_str
-    except Exception as exc:
-        logger.warning("Activity Logs query failed: %s", exc)
-
-    # 3. Metrics for resources that support them
-    metrizable_types = {
-        "Microsoft.Compute/virtualMachines": "Percentage CPU",
-        "Microsoft.Web/sites": "CpuPercentage",
-        "Microsoft.Web/serverFarms": "CpuPercentage",
-        "Microsoft.Sql/servers/databases": "dtu_consumption_percent",
-        "Microsoft.Cache/Redis": "usedmemorypercentage",
-        "Microsoft.DocumentDb/databaseAccounts": "TotalRequests",
-        "Microsoft.CognitiveServices/accounts": "TotalCalls",
-        "Microsoft.Storage/storageAccounts": "Transactions",
-        "Microsoft.ContainerRegistry/registries": "TotalPullCount",
-    }
-    for res in resources:
-        rtype = res.get("type", "")
-        if rtype not in metrizable_types:
-            continue
-        metric_name = metrizable_types[rtype]
+    def _get_advisor_recommendations():
+        """Fetch Advisor cost recommendations."""
+        recs_list = []
         try:
-            # Azure Monitor requires ISO 8601 without space in tz offset
+            recs = advisor_client.recommendations.list(filter="Category eq 'Cost'")
+            for rec in recs:
+                rid = ""
+                if rec.resource_metadata and rec.resource_metadata.resource_id:
+                    rid = rec.resource_metadata.resource_id
+                impacted = getattr(rec, "impacted_field", "") or ""
+                recs_list.append({
+                    "resourceId": rid,
+                    "impactedField": impacted,
+                    "impactedValue": getattr(rec, "impacted_value", "") or "",
+                    "category": str(rec.category),
+                    "impact": str(rec.impact),
+                    "problem": rec.short_description.problem if rec.short_description else "",
+                    "solution": rec.short_description.solution if rec.short_description else "",
+                })
+        except Exception as exc:
+            logger.warning("Advisor query failed: %s", exc)
+        return recs_list
+
+    def _get_activity_logs():
+        """Fetch Activity Logs for the resource group."""
+        logs_dict = {}
+        now = datetime.now(timezone.utc)
+        start_time = now - timedelta(days=60)
+        try:
+            logs = monitor_client.activity_logs.list(
+                filter=(
+                    f"eventTimestamp ge '{start_time.isoformat()}' "
+                    f"and eventTimestamp le '{now.isoformat()}' "
+                    f"and resourceGroupName eq '{resource_group}'"
+                ),
+            )
+            for log_entry in logs:
+                rid = log_entry.resource_id or ""
+                name = rid.split("/")[-1] if rid else "unknown"
+                if name not in logs_dict:
+                    logs_dict[name] = {"count": 0, "last_event": None}
+                logs_dict[name]["count"] += 1
+                ts = log_entry.event_timestamp
+                if ts:
+                    ts_str = ts.isoformat()
+                    prev = logs_dict[name]["last_event"]
+                    if not prev or ts_str > prev:
+                        logs_dict[name]["last_event"] = ts_str
+        except Exception as exc:
+            logger.warning("Activity Logs query failed: %s", exc)
+        return logs_dict
+
+    def _get_metrics_for_resource(res, metric_name):
+        """Fetch metrics for a single resource."""
+        now = datetime.now(timezone.utc)
+        start_time = now - timedelta(days=60)
+        try:
             ts_start = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
             ts_end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             metrics_data = monitor_client.metrics.list(
@@ -120,15 +150,58 @@ def _gather_monitoring_data(subscription_id: str, resource_group: str, resources
                         if dp.average is not None:
                             values.append(dp.average)
             if values:
-                result["metrics"][res["name"]] = {
+                # Compute stats in single pass for efficiency
+                total = sum(values)
+                count = len(values)
+                return {
+                    "name": res["name"],
                     "metric": metric_name,
-                    "avg": round(sum(values) / len(values), 2),
+                    "avg": round(total / count, 2),
                     "max": round(max(values), 2),
                     "min": round(min(values), 2),
-                    "datapoints": len(values),
+                    "datapoints": count,
                 }
         except Exception as exc:
-            logger.warning("Metrics query failed for %s (%s): %s", res["name"], rtype, exc)
+            logger.warning("Metrics query failed for %s (%s): %s", res["name"], res.get("type"), exc)
+        return None
+
+    # Parallelize the three main queries
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        # Submit Advisor and Activity Logs tasks
+        advisor_future = loop.run_in_executor(executor, _get_advisor_recommendations)
+        activity_logs_future = loop.run_in_executor(executor, _get_activity_logs)
+
+        # Submit metrics tasks for each metrizable resource
+        metrizable_types = {
+            "Microsoft.Compute/virtualMachines": "Percentage CPU",
+            "Microsoft.Web/sites": "CpuPercentage",
+            "Microsoft.Web/serverFarms": "CpuPercentage",
+            "Microsoft.Sql/servers/databases": "dtu_consumption_percent",
+            "Microsoft.Cache/Redis": "usedmemorypercentage",
+            "Microsoft.DocumentDb/databaseAccounts": "TotalRequests",
+            "Microsoft.CognitiveServices/accounts": "TotalCalls",
+            "Microsoft.Storage/storageAccounts": "Transactions",
+            "Microsoft.ContainerRegistry/registries": "TotalPullCount",
+        }
+
+        metrics_futures = []
+        for res in resources:
+            rtype = res.get("type", "")
+            if rtype in metrizable_types:
+                metric_name = metrizable_types[rtype]
+                metrics_futures.append(
+                    loop.run_in_executor(executor, _get_metrics_for_resource, res, metric_name)
+                )
+
+        # Wait for all tasks to complete
+        result["advisor_recommendations"] = await advisor_future
+        result["activity_logs"] = await activity_logs_future
+
+        if metrics_futures:
+            metrics_results = await asyncio.gather(*metrics_futures)
+            for metric_result in metrics_results:
+                if metric_result:
+                    result["metrics"][metric_result["name"]] = metric_result
 
     return result
 
@@ -272,14 +345,48 @@ async def report_cost_optimization(req: func.HttpRequest, client) -> func.HttpRe
         )
 
     resources = payload.get("resources", [])
+
+    # Validate resources list
+    if not isinstance(resources, list):
+        return func.HttpResponse(
+            body=json.dumps({"error": "resources must be a list"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    # Limit resources to prevent DoS
+    if len(resources) > 1000:
+        return func.HttpResponse(
+            body=json.dumps({"error": "resources list too large (max 1000)"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
     run_id = payload.get("run_id") or f"costopt-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+
+    # Validate run_id format if provided
+    if payload.get("run_id") and not _validate_instance_id(run_id):
+        return func.HttpResponse(
+            body=json.dumps({"error": "Invalid run_id format"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    # Validate user_id
+    user_id = payload.get("user_id", "operator")
+    if len(user_id) > 100:
+        return func.HttpResponse(
+            body=json.dumps({"error": "user_id too long (max 100 characters)"}),
+            status_code=400,
+            mimetype="application/json",
+        )
 
     instance_id = await client.start_new(
         "cost_optimization_orchestrator",
         instance_id=run_id,
         client_input={
             "run_id": run_id,
-            "user_id": payload.get("user_id", "operator"),
+            "user_id": user_id,
             "resources": resources,
         },
     )
@@ -312,14 +419,19 @@ async def report_by_group(req: func.HttpRequest, client) -> func.HttpResponse:
             mimetype="application/json",
         )
 
+    # Validate resource group name format to prevent injection
+    if not _validate_resource_group_name(resource_group):
+        return func.HttpResponse(
+            body=json.dumps({"error": "Invalid resource_group name format"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
     # Step 1: Discover resources using Azure Resource Management (MI-based)
     from azure.mgmt.resource import ResourceManagementClient
 
     try:
-        arm_client = ResourceManagementClient(_credential, os.getenv(
-            "AZURE_SUBSCRIPTION_ID",
-            "00000000-0000-0000-0000-000000000000",
-        ))
+        arm_client = ResourceManagementClient(_credential, config.AZURE_SUBSCRIPTION_ID)
         raw_resources = list(arm_client.resources.list_by_resource_group(resource_group))
         resource_list = [
             {
@@ -347,9 +459,8 @@ async def report_by_group(req: func.HttpRequest, client) -> func.HttpResponse:
         )
 
     # Step 2: Gather monitoring data via Azure SDK (Advisor, Activity Logs, Metrics)
-    subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID", "00000000-0000-0000-0000-000000000000")
     try:
-        monitoring = _gather_monitoring_data(subscription_id, resource_group, resource_list)
+        monitoring = await _gather_monitoring_data(config.AZURE_SUBSCRIPTION_ID, resource_group, resource_list)
         logger.info(
             "Monitoring data: %d advisor recs, %d resources with activity, %d with metrics",
             len(monitoring["advisor_recommendations"]),
@@ -434,6 +545,15 @@ async def report_by_group(req: func.HttpRequest, client) -> func.HttpResponse:
 async def submit_decision(req: func.HttpRequest, client) -> func.HttpResponse:
     """Submit human decision for high-risk action batch (from dashboard UI)."""
     instance_id = req.route_params.get("instanceId")
+
+    # Validate instance_id
+    if not instance_id or not _validate_instance_id(instance_id):
+        return func.HttpResponse(
+            body=json.dumps({"error": "Invalid instance_id format"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
     try:
         body = req.get_json()
     except ValueError:
@@ -443,7 +563,7 @@ async def submit_decision(req: func.HttpRequest, client) -> func.HttpResponse:
             mimetype="application/json",
         )
 
-    decision = body.get("decision")
+    decision = body.get("decision", "").lower()
     if decision not in ("approve", "reject"):
         return func.HttpResponse(
             body=json.dumps({"error": "decision must be 'approve' or 'reject'"}),
@@ -477,12 +597,14 @@ async def submit_decision(req: func.HttpRequest, client) -> func.HttpResponse:
 @app.durable_client_input(client_name="client")
 async def email_decision(req: func.HttpRequest, client) -> func.HttpResponse:
     """Handle approve/reject clicks from email links (GET with query params)."""
+    import html
+
     instance_id = req.route_params.get("instanceId")
     decision = req.params.get("decision", "").lower()
     function_key = req.params.get("key", "")
     stage = req.params.get("stage", "finance").lower()
 
-    expected_key = os.getenv("APPROVAL_CALLBACK_SECRET", "<your-secret-token>")
+    expected_key = config.APPROVAL_CALLBACK_SECRET
     if function_key != expected_key:
         return func.HttpResponse(
             body="<html><body><h2>Unauthorized</h2><p>Invalid approval link.</p></body></html>",
@@ -513,11 +635,13 @@ async def email_decision(req: func.HttpRequest, client) -> func.HttpResponse:
         )
     except Exception as exc:
         logger.warning("raise_event failed for %s: %s", instance_id, exc)
+        # HTML-escape instance_id to prevent XSS
+        safe_instance_id = html.escape(instance_id or "unknown")
         return func.HttpResponse(
             body=f"""<html><body style="font-family:Segoe UI,sans-serif;text-align:center;padding:60px">
             <div style="font-size:64px">⏰</div>
             <h1 style="color:#f59e0b">Link Expired</h1>
-            <p>The orchestration <strong>{instance_id}</strong> has already completed or expired.</p>
+            <p>The orchestration <strong>{safe_instance_id}</strong> has already completed or expired.</p>
             <p style="color:#888;font-size:14px">No action was taken. You can close this tab.</p>
             </body></html>""",
             status_code=200,
@@ -527,11 +651,13 @@ async def email_decision(req: func.HttpRequest, client) -> func.HttpResponse:
     emoji = "✅" if decision == "approve" else "❌"
     color = "#10b981" if decision == "approve" else "#ef4444"
     stage_label = stage.capitalize()
+    # HTML-escape instance_id to prevent XSS
+    safe_instance_id = html.escape(instance_id or "unknown")
     return func.HttpResponse(
         body=f"""<html><body style="font-family:Segoe UI,sans-serif;text-align:center;padding:60px">
         <div style="font-size:64px">{emoji}</div>
         <h1 style="color:{color}">{stage_label} Decision: {decision.upper()}</h1>
-        <p>Your {stage_label.lower()} decision for <strong>{instance_id}</strong> has been recorded.</p>
+        <p>Your {stage_label.lower()} decision for <strong>{safe_instance_id}</strong> has been recorded.</p>
         <p style="color:#888;font-size:14px">You can close this tab.</p>
         </body></html>""",
         status_code=200,
@@ -618,6 +744,32 @@ async def trigger_digest(req: func.HttpRequest, client) -> func.HttpResponse:
 
     # Allow filtering to specific RGs, or scan all
     rg_filter = payload.get("resource_groups", [])
+
+    # Validate resource_groups format
+    if not isinstance(rg_filter, list):
+        return func.HttpResponse(
+            body=json.dumps({"error": "resource_groups must be a list"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    # Limit number of resource groups to prevent DoS
+    if len(rg_filter) > 100:
+        return func.HttpResponse(
+            body=json.dumps({"error": "resource_groups list too large (max 100)"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    # Validate each resource group name
+    for rg in rg_filter:
+        if not isinstance(rg, str) or not _validate_resource_group_name(rg):
+            return func.HttpResponse(
+                body=json.dumps({"error": f"Invalid resource group name: {rg}"}),
+                status_code=400,
+                mimetype="application/json",
+            )
+
     if not rg_filter:
         try:
             arm = ResourceManagementClient(_credential, subscription_id)
@@ -630,6 +782,14 @@ async def trigger_digest(req: func.HttpRequest, client) -> func.HttpResponse:
             )
 
     run_id = payload.get("run_id") or f"digest-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+
+    # Validate run_id format if provided
+    if payload.get("run_id") and not _validate_instance_id(run_id):
+        return func.HttpResponse(
+            body=json.dumps({"error": "Invalid run_id format"}),
+            status_code=400,
+            mimetype="application/json",
+        )
 
     await client.start_new(
         "daily_digest_orchestrator",
