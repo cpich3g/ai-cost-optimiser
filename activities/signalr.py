@@ -262,6 +262,158 @@ def _build_finance_email(instance_id: str, data: dict) -> dict:
     }
 
 
+def _build_digest_email(instance_id: str, data: dict) -> dict:
+    """Daily cost digest — consolidated view across all resource groups."""
+    rg_results = data.get("rg_results", [])
+    total_savings = data.get("total_savings_monthly", 0)
+    annual_savings = round(total_savings * 12, 2)
+    total_actionable = data.get("total_actionable", 0)
+    total_resources = data.get("total_resources", 0)
+    rg_count = data.get("rg_count", 0)
+    run_id = data.get("run_id", instance_id)
+
+    # Sort RGs by savings (biggest waste first)
+    sorted_rgs = sorted(rg_results, key=lambda r: r.get("estimated_savings_monthly", 0), reverse=True)
+
+    summary_table = (
+        "<table style='width:100%;border-collapse:collapse;font-size:14px'>"
+        + _summary_row("Subscription", f"<code style='font-size:12px'>{data.get('subscription_id', '')[:12]}...</code>")
+        + _summary_row("Resource Groups Scanned", str(rg_count))
+        + _summary_row("Total Resources", str(total_resources))
+        + _summary_row("Actionable Findings", str(total_actionable), bold=True, color="#f59e0b")
+        + _summary_row("Est. Monthly Savings", f"${total_savings:,.2f}", bold=True, color="#10b981")
+        + _summary_row("Est. Annual Savings", f"${annual_savings:,.2f}", bold=True, color="#10b981")
+        + _summary_row("Scan ID", f"<code style='font-size:12px'>{run_id}</code>")
+        + "</table>"
+    )
+
+    # Per-RG breakdown table
+    rg_rows = ""
+    for rg in sorted_rgs:
+        name = rg.get("resource_group", "unknown")
+        savings = rg.get("estimated_savings_monthly", 0)
+        actionable = rg.get("actionable_count", 0)
+        res_count = rg.get("resource_count", 0)
+        error = rg.get("error", "")
+
+        if error:
+            status_badge = (
+                "<span style='background:#ef4444;color:#fff;padding:2px 8px;"
+                "border-radius:4px;font-size:11px'>error</span>"
+            )
+            savings_str = "—"
+        elif actionable == 0:
+            status_badge = (
+                "<span style='background:#10b981;color:#fff;padding:2px 8px;"
+                "border-radius:4px;font-size:11px'>healthy</span>"
+            )
+            savings_str = "$0"
+        else:
+            status_badge = (
+                f"<span style='background:#f59e0b;color:#fff;padding:2px 8px;"
+                f"border-radius:4px;font-size:11px'>{actionable} actions</span>"
+            )
+            savings_str = f"<strong style='color:#10b981'>${savings:,.2f}</strong>"
+
+        rg_rows += (
+            f"<tr>"
+            f"<td style='padding:10px 8px;border-bottom:1px solid #eee'>"
+            f"<strong>{name}</strong></td>"
+            f"<td style='padding:10px 8px;border-bottom:1px solid #eee;"
+            f"text-align:center'>{res_count}</td>"
+            f"<td style='padding:10px 8px;border-bottom:1px solid #eee;"
+            f"text-align:center'>{status_badge}</td>"
+            f"<td style='padding:10px 8px;border-bottom:1px solid #eee;"
+            f"text-align:right'>{savings_str}/mo</td>"
+            f"</tr>"
+        )
+
+    rg_table = (
+        "<table style='width:100%;border-collapse:collapse;font-size:13px'>"
+        "<thead><tr style='background:#f8f9fa;text-align:left'>"
+        "<th style='padding:10px 8px;font-weight:600'>Resource Group</th>"
+        "<th style='padding:10px 8px;font-weight:600;text-align:center'>Resources</th>"
+        "<th style='padding:10px 8px;font-weight:600;text-align:center'>Status</th>"
+        "<th style='padding:10px 8px;font-weight:600;text-align:right'>Savings</th>"
+        f"</tr></thead><tbody>{rg_rows}</tbody></table>"
+    )
+
+    # Top recommendations (up to 10 across all RGs)
+    all_recs = []
+    for rg in sorted_rgs:
+        for rec in rg.get("recommendations", []):
+            rec["_rg"] = rg.get("resource_group", "unknown")
+            all_recs.append(rec)
+    all_recs.sort(key=lambda r: float(r.get("estimatedSavingsMonthlyUsd", 0) or 0), reverse=True)
+    top_recs = all_recs[:10]
+
+    top_rows = ""
+    for a in top_recs:
+        risk = str(a.get("riskLevel", "medium")).lower()
+        action_type = str(a.get("actionType", ""))
+        name, rtype = _resource_short(a.get("resourceId", ""))
+        icon = _ACTION_ICONS.get(action_type.lower(), "⚙️")
+        color = _RISK_COLORS.get(risk, "#6b7280")
+        savings = f"${a.get('estimatedSavingsMonthlyUsd', 0)}"
+        top_rows += (
+            f"<tr>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee'>"
+            f"<strong>{name}</strong><br>"
+            f"<span style='font-size:11px;color:#888'>{a.get('_rg', '')}</span></td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee;text-align:center'>"
+            f"{icon} {action_type}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee;text-align:center'>"
+            f"<span style='background:{color};color:#fff;padding:2px 8px;"
+            f"border-radius:4px;font-size:11px'>{risk}</span></td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee;"
+            f"text-align:right;font-weight:600'>{savings}/mo</td>"
+            f"</tr>"
+        )
+
+    top_recs_html = ""
+    if top_rows:
+        top_recs_html = (
+            "<h3 style='margin:0 0 12px;font-size:15px'>🔥 Top Savings Opportunities</h3>"
+            "<table style='width:100%;border-collapse:collapse;font-size:13px'>"
+            "<thead><tr style='background:#f8f9fa;text-align:left'>"
+            "<th style='padding:8px;font-weight:600'>Resource</th>"
+            "<th style='padding:8px;font-weight:600;text-align:center'>Action</th>"
+            "<th style='padding:8px;font-weight:600;text-align:center'>Risk</th>"
+            "<th style='padding:8px;font-weight:600;text-align:right'>Savings</th>"
+            f"</tr></thead><tbody>{top_rows}</tbody></table>"
+        )
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    context_html = (
+        f"<p><strong>📊 Daily Cost Optimisation Digest</strong> — {now_str}</p>"
+        "<p>Your Azure tenant has been scanned for cost savings opportunities. "
+        f"Across <strong>{rg_count}</strong> resource groups and "
+        f"<strong>{total_resources}</strong> resources, the agent found "
+        f"<strong>{total_actionable}</strong> actionable optimisations that could save "
+        f"an estimated <strong>${total_savings:,.2f}/month "
+        f"(${annual_savings:,.2f}/year)</strong>.</p>"
+        "<p style='font-size:13px;color:#555'>To act on these recommendations, "
+        "launch a full optimisation run from the dashboard for the specific resource "
+        "group. The full flow includes engineering &amp; finance approval before any "
+        "changes are simulated.</p>"
+    )
+
+    body = _wrap_email(
+        "Daily Cost Digest",
+        f"{rg_count} resource groups · ${total_savings:,.2f}/mo potential savings",
+        _section(summary_table, bg="#f8f9fa")
+        + _section(context_html)
+        + _section(f"<h3 style='margin:0 0 12px;font-size:15px'>Resource Group Breakdown</h3>{rg_table}")
+        + (_section(top_recs_html) if top_recs_html else ""),
+    )
+
+    return {
+        "to": os.getenv("DIGEST_RECIPIENT_EMAIL", "justinjoy@microsoft.com"),
+        "subject": f"📊 Daily Azure Cost Digest — ${total_savings:,.2f}/mo savings across {rg_count} RGs",
+        "htmlBody": body,
+    }
+
+
 def _build_summary_email(instance_id: str, data: dict) -> dict:
     """Post-execution summary sent to both engineering and finance."""
     rg = data.get("resourceGroup", "unknown")
@@ -385,6 +537,8 @@ def register_signalr_activities(app, _hub_name: str, _connection_setting: str):
                 email_payload = _build_finance_email(instance_id, data)
         elif event == "execution_summary":
             email_payload = _build_summary_email(instance_id, data)
+        elif event == "daily_digest":
+            email_payload = _build_digest_email(instance_id, data)
 
         if email_payload and logicapp_url:
             try:

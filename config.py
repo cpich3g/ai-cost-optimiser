@@ -20,3 +20,8 @@ MCP_SERVER_URL = os.getenv(
     "https://ca-azure-mcp-server.greenground-a1172782.swedencentral.azurecontainerapps.io",
 )
 MCP_SERVER_SCOPE = os.getenv("MCP_SERVER_SCOPE", "")
+
+# Daily digest settings
+DAILY_DIGEST_CRON = os.getenv("DAILY_DIGEST_CRON", "0 0 8 * * *")  # 8 AM UTC daily
+DIGEST_RECIPIENT_EMAIL = os.getenv("DIGEST_RECIPIENT_EMAIL", "justinjoy@microsoft.com")
+AZURE_SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID", "db2cf8dd-6845-470c-84b4-1a3db9946d36")

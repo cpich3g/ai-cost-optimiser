@@ -14,6 +14,7 @@ from mcp.client.sse import sse_client
 import config
 from activities.signalr import register_signalr_activities
 from orchestrators.incident_response import register_orchestrator
+from orchestrators.daily_digest import register_digest_orchestrator
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +254,7 @@ app = AgentFunctionApp(
 )
 
 register_orchestrator(app)
+register_digest_orchestrator(app)
 register_signalr_activities(app, config.SIGNALR_HUB_NAME, config.SIGNALR_CONNECTION_SETTING)
 
 
@@ -560,6 +562,93 @@ async def get_status(req: func.HttpRequest, client) -> func.HttpResponse:
             }
         ),
         status_code=200,
+        mimetype="application/json",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Daily Digest — Timer trigger (8 AM UTC) and manual HTTP trigger
+# ---------------------------------------------------------------------------
+
+@app.timer_trigger(schedule=config.DAILY_DIGEST_CRON, arg_name="timer", run_on_startup=False)
+@app.durable_client_input(client_name="client")
+async def daily_digest_timer(timer: func.TimerRequest, client) -> None:
+    """Auto-scheduled daily cost digest across all resource groups."""
+    from azure.mgmt.resource import ResourceManagementClient
+
+    subscription_id = config.AZURE_SUBSCRIPTION_ID
+    logger.info("Daily digest triggered for subscription %s", subscription_id)
+
+    try:
+        arm = ResourceManagementClient(_credential, subscription_id)
+        rg_list = [rg.name for rg in arm.resource_groups.list()]
+    except Exception as exc:
+        logger.error("Failed to list resource groups: %s", exc)
+        return
+
+    if not rg_list:
+        logger.info("No resource groups found — skipping digest.")
+        return
+
+    run_id = f"digest-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    await client.start_new(
+        "daily_digest_orchestrator",
+        instance_id=run_id,
+        client_input={
+            "run_id": run_id,
+            "subscription_id": subscription_id,
+            "resource_groups": rg_list,
+        },
+    )
+    logger.info("Daily digest started: %s (%d RGs)", run_id, len(rg_list))
+
+
+@app.route(route="cost-optimization/digest", methods=["POST"])
+@app.durable_client_input(client_name="client")
+async def trigger_digest(req: func.HttpRequest, client) -> func.HttpResponse:
+    """Manually trigger a cost digest (same as the daily timer)."""
+    from azure.mgmt.resource import ResourceManagementClient
+
+    subscription_id = config.AZURE_SUBSCRIPTION_ID
+
+    try:
+        payload = req.get_json()
+    except ValueError:
+        payload = {}
+
+    # Allow filtering to specific RGs, or scan all
+    rg_filter = payload.get("resource_groups", [])
+    if not rg_filter:
+        try:
+            arm = ResourceManagementClient(_credential, subscription_id)
+            rg_filter = [rg.name for rg in arm.resource_groups.list()]
+        except Exception as exc:
+            return func.HttpResponse(
+                body=json.dumps({"error": f"Failed to list resource groups: {exc}"}),
+                status_code=502,
+                mimetype="application/json",
+            )
+
+    run_id = payload.get("run_id") or f"digest-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+
+    await client.start_new(
+        "daily_digest_orchestrator",
+        instance_id=run_id,
+        client_input={
+            "run_id": run_id,
+            "subscription_id": subscription_id,
+            "resource_groups": rg_filter,
+        },
+    )
+
+    return func.HttpResponse(
+        body=json.dumps({
+            "instance_id": run_id,
+            "status": "started",
+            "resource_groups": rg_filter,
+            "rg_count": len(rg_filter),
+        }),
+        status_code=202,
         mimetype="application/json",
     )
 
